@@ -1,0 +1,20 @@
+{
+  "name": "nexus-mail",
+  "version": "1.0.0",
+  "description": "Multi-tenant Custom Domain Email Client (Desktop & Web) with Cloudflare Routing",
+  "scripts": {
+    "dev": "npm --prefix web run dev",
+    "dev:web": "npm --prefix web run dev",
+    "build": "npm --prefix web run build",
+    "build:web": "npm --prefix web run build",
+    "start": "npm --prefix web run start",
+    "start:web": "npm --prefix web run start",
+    "dev:desktop": "npm --prefix desktop start",
+    "deploy:worker": "npm --prefix cloudflare-worker run deploy",
+    "test:inbound": "node scripts/test-inbound.js",
+    "install:web": "npm --prefix web install",
+    "install:desktop": "npm --prefix desktop install",
+    "install:worker": "npm --prefix cloudflare-worker install",
+    "install:all": "npm --prefix web install && npm --prefix desktop install && npm --prefix cloudflare-worker install"
+  }
+}

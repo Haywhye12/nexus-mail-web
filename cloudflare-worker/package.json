@@ -1,0 +1,18 @@
+{
+  "name": "nexus-mail-inbound-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Email Routing Worker that parses incoming emails and triggers webhooks",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "postal-mime": "^2.4.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241112.0",
+    "typescript": "^5.6.3",
+    "wrangler": "^3.90.0"
+  }
+}

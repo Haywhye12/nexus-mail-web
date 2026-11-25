@@ -1,0 +1,10 @@
+{
+  "name": "nexus-mail-inbound-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "WEBHOOK_URL": "https://your-app-domain.vercel.app/api/inbound",
+    "WEBHOOK_SECRET": "nexus_mail_secret_change_in_production"
+  }
+}

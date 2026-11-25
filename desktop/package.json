@@ -1,0 +1,21 @@
+{
+  "name": "nexus-mail-desktop",
+  "version": "1.0.0",
+  "description": "Desktop email client for info@devgeeksnexus.com",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.devgeeksnexus.mail",
+    "productName": "Nexus Mail",
+    "win": {
+      "target": ["nsis", "portable"]
+    }
+  }
+}
