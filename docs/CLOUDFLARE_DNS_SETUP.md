@@ -74,9 +74,39 @@ In `nexus-mail/cloudflare-worker`:
 
 ---
 
-## Part 4: Testing
+## Part 4: Multi-Account Email Routing (Inbound)
 
-1. Send an email from your personal Gmail or phone to `info@devgeeksnexus.com`.
-2. Cloudflare receives the email $\rightarrow$ passes it to `nexus-mail-inbound-worker`.
-3. The Worker parses the email and triggers `POST /api/inbound`.
-4. Open your **Nexus Mail** desktop or web app — the message will appear right inside your Inbox!
+To receive emails across all three accounts (`info@`, `ayomidebobani@`, `admin@`), configure Cloudflare Email Routing rules:
+
+1. Open **Cloudflare Dashboard** $\rightarrow$ select domain **`devgeeksnexus.com`**.
+2. Go to **Email** $\rightarrow$ **Email Routing** $\rightarrow$ **Routing Rules**.
+3. You have two convenient options:
+
+### Option A: Catch-All Rule (Recommended - 1 Click)
+- Scroll to the **Catch-all address** card.
+- Set **Action**: `Send to Worker`.
+- Set **Destination**: `nexus-mail-web`.
+- Click **Save**.
+- *This will automatically route all emails addressed to `@devgeeksnexus.com` (including `ayomidebobani@`, `admin@`, and `info@`) directly into your Nexus Mail app!*
+
+### Option B: Individual Custom Addresses
+Under **Custom addresses**, click **Create address** for each:
+1. **`info@devgeeksnexus.com`** $\rightarrow$ Action: `Send to Worker` $\rightarrow$ `nexus-mail-web`.
+2. **`ayomidebobani@devgeeksnexus.com`** $\rightarrow$ Action: `Send to Worker` $\rightarrow$ `nexus-mail-web`.
+3. **`admin@devgeeksnexus.com`** $\rightarrow$ Action: `Send to Worker` $\rightarrow$ `nexus-mail-web`.
+
+---
+
+## Part 5: Testing Multi-Account Web Mail
+
+1. Open the live web app: **[https://nexus-mail-web.ayomidebobani.workers.dev](https://nexus-mail-web.ayomidebobani.workers.dev)**
+2. In the sidebar under **Mailbox Accounts**, click to switch between:
+   - **All Mailboxes** (unified view with color badges)
+   - **Info Desk** (`info@devgeeksnexus.com`)
+   - **Ayomide Bobani** (`ayomidebobani@devgeeksnexus.com`)
+   - **Administrator** (`admin@devgeeksnexus.com`)
+3. Click **Compose Email**:
+   - The **From** dropdown lets you pick which account sends the email (`info@`, `ayomidebobani@`, or `admin@`).
+   - Fill in **To**, optional **Cc**, **Bcc**, subject, and body, then click **Send Email**.
+   - Resend dispatches the email using cryptographic DKIM & SPF authentication for that address.
+4. Send incoming test emails to `ayomidebobani@devgeeksnexus.com` or `admin@devgeeksnexus.com` $\rightarrow$ they will appear in their respective mailboxes with real-time badges!
