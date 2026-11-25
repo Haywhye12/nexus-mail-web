@@ -6,5 +6,11 @@
   "vars": {
     "WEBHOOK_URL": "https://nexus-mail-web.pages.dev/api/inbound",
     "WEBHOOK_SECRET": "nexus_mail_secret_change_in_production"
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "EMAILS",
+      "id": "b9e9f6539550499da494013590b3b6ab"
+    }
+  ]
 }
