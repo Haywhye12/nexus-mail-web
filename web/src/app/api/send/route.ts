@@ -1,16 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { sendMail } from '@/lib/email-sender';
-import { Message } from '@/lib/types';
+import { Message, Attachment } from '@/lib/types';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { from, fromName, to, subject, text, html, mailboxId, tenantId } = body;
+    const { from, fromName, to, subject, text, html, mailboxId, tenantId, attachments } = body;
 
     if (!from || !to || !subject) {
       return NextResponse.json({ error: 'Missing from, to, or subject' }, { status: 400 });
     }
+
+    const cleanAttachments: Attachment[] = Array.isArray(attachments) ? attachments : [];
 
     // 1. Dispatch through email delivery transport
     const sendResult = await sendMail({
@@ -20,6 +22,7 @@ export async function POST(req: NextRequest) {
       subject,
       text,
       html,
+      attachments: cleanAttachments,
     });
 
     // 2. Save into Sent folder
@@ -38,7 +41,7 @@ export async function POST(req: NextRequest) {
       isStarred: false,
       date: new Date().toISOString(),
       messageId: sendResult.messageId,
-      attachments: [],
+      attachments: cleanAttachments,
     };
 
     db.createMessage(sentMessage);

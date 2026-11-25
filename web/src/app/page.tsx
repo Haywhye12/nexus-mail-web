@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Inbox,
   Send,
@@ -17,9 +17,16 @@ import {
   Copy,
   Check,
   X,
-  ExternalLink,
+  Paperclip,
+  Image as ImageIcon,
+  Link as LinkIcon,
+  Bold,
+  Italic,
+  Underline,
+  Download,
+  FileText,
 } from 'lucide-react';
-import { Message, Mailbox, Domain } from '@/lib/types';
+import { Message, Mailbox, Domain, Attachment } from '@/lib/types';
 
 export default function MailApp() {
   const [activeTab, setActiveTab] = useState<'mail' | 'domains'>('mail');
@@ -38,10 +45,24 @@ export default function MailApp() {
   const [composeTo, setComposeTo] = useState('');
   const [composeSubject, setComposeSubject] = useState('');
   const [composeBody, setComposeBody] = useState('');
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [sending, setSending] = useState(false);
   const [sendSuccessNote, setSendSuccessNote] = useState<string | null>(null);
 
-  // New Domain Modal
+  // Link Insertion Modal State
+  const [isLinkModalOpen, setIsLinkModalOpen] = useState(false);
+  const [linkUrl, setLinkUrl] = useState('');
+  const [linkText, setLinkText] = useState('');
+
+  // Image Insertion Modal State
+  const [isImageModalOpen, setIsImageModalOpen] = useState(false);
+  const [imageUrl, setImageUrl] = useState('');
+  const [imageAlt, setImageAlt] = useState('');
+
+  // File Input Ref
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // New Domain Modal State
   const [isNewDomainOpen, setIsNewDomainOpen] = useState(false);
   const [newDomainName, setNewDomainName] = useState('');
 
@@ -105,6 +126,60 @@ export default function MailApp() {
     setSelectedMessage(updated.length > 0 ? updated[0] : null);
   };
 
+  // Handle local file / image selection
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    Array.from(files).forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64String = (reader.result as string).split(',')[1];
+        const newAttachment: Attachment = {
+          filename: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          size: file.size,
+          contentBase64: base64String,
+        };
+        setAttachments((prev) => [...prev, newAttachment]);
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // Reset input so same file can be picked again if desired
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const removeAttachment = (index: number) => {
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  // Formatting helpers for rich text area
+  const insertFormatting = (tag: 'b' | 'i' | 'u') => {
+    setComposeBody((prev) => `${prev}<${tag}>text</${tag}>`);
+  };
+
+  const insertLink = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!linkUrl) return;
+    const textToDisplay = linkText || linkUrl;
+    const linkHtml = `<a href="${linkUrl}" target="_blank" rel="noopener noreferrer" style="color: #4f46e5; text-decoration: underline;">${textToDisplay}</a>`;
+    setComposeBody((prev) => `${prev} ${linkHtml} `);
+    setLinkUrl('');
+    setLinkText('');
+    setIsLinkModalOpen(false);
+  };
+
+  const insertImage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!imageUrl) return;
+    const imgHtml = `<p><img src="${imageUrl}" alt="${imageAlt || 'image'}" style="max-width: 100%; border-radius: 8px; margin: 8px 0;" /></p>`;
+    setComposeBody((prev) => `${prev}\n${imgHtml}\n`);
+    setImageUrl('');
+    setImageAlt('');
+    setIsImageModalOpen(false);
+  };
+
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!composeTo || !composeSubject) return;
@@ -120,9 +195,10 @@ export default function MailApp() {
           fromName: 'DevGeeksNexus Team',
           to: composeTo,
           subject: composeSubject,
-          text: composeBody,
-          html: `<p>${composeBody.replace(/\\n/g, '<br/>')}</p>`,
+          text: composeBody.replace(/<[^>]*>?/gm, ''), // plain text fallback
+          html: `<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">${composeBody.replace(/\n/g, '<br/>')}</div>`,
           mailboxId: selectedMailboxId,
+          attachments,
         }),
       });
 
@@ -134,9 +210,10 @@ export default function MailApp() {
           setComposeTo('');
           setComposeSubject('');
           setComposeBody('');
+          setAttachments([]);
           setSendSuccessNote(null);
           fetchMessages();
-        }, 1500);
+        }, 1200);
       }
     } catch (err) {
       alert('Failed to send email');
@@ -169,6 +246,12 @@ export default function MailApp() {
     navigator.clipboard.writeText(text);
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
   const filteredMessages = messages.filter((m) => {
@@ -304,7 +387,7 @@ export default function MailApp() {
         <div className="p-3 border-t border-slate-800 text-xs text-slate-400 flex items-center justify-between">
           <span>Desktop & Web</span>
           <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300">
-            v1.0.0
+            v1.1.0
           </span>
         </div>
       </aside>
@@ -381,16 +464,24 @@ export default function MailApp() {
                       {msg.text || 'No preview available'}
                     </div>
                     <div className="flex items-center justify-between mt-2 pt-1">
-                      <button
-                        onClick={(e) => handleToggleStar(e, msg.id)}
-                        className="text-slate-400 hover:text-amber-500"
-                      >
-                        <Star
-                          className={`w-3.5 h-3.5 ${
-                            msg.isStarred ? 'fill-amber-400 text-amber-500' : ''
-                          }`}
-                        />
-                      </button>
+                      <div className="flex items-center space-x-2">
+                        <button
+                          onClick={(e) => handleToggleStar(e, msg.id)}
+                          className="text-slate-400 hover:text-amber-500"
+                        >
+                          <Star
+                            className={`w-3.5 h-3.5 ${
+                              msg.isStarred ? 'fill-amber-400 text-amber-500' : ''
+                            }`}
+                          />
+                        </button>
+                        {msg.attachments?.length > 0 && (
+                          <span className="flex items-center text-[10px] text-slate-400 font-mono">
+                            <Paperclip className="w-3 h-3 mr-0.5" />
+                            {msg.attachments.length}
+                          </span>
+                        )}
+                      </div>
                       {!msg.isRead && (
                         <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
                       )}
@@ -453,31 +544,66 @@ export default function MailApp() {
                     </div>
                   </div>
 
-                  {/* HTML Content */}
+                  {/* Rendered HTML Content */}
                   <div
-                    className="prose max-w-none text-slate-700 text-sm leading-relaxed"
+                    className="prose max-w-none text-slate-800 text-sm leading-relaxed"
                     dangerouslySetInnerHTML={{ __html: selectedMessage.html }}
                   />
 
-                  {/* Attachments Section if present */}
+                  {/* Attached Files & Images Tray */}
                   {selectedMessage.attachments?.length > 0 && (
-                    <div className="mt-8 pt-4 border-t border-slate-100">
-                      <h3 className="text-xs font-semibold uppercase text-slate-500 tracking-wider mb-2">
-                        Attachments ({selectedMessage.attachments.length})
+                    <div className="mt-8 pt-6 border-t border-slate-200">
+                      <h3 className="text-xs font-semibold uppercase text-slate-500 tracking-wider mb-3 flex items-center space-x-1.5">
+                        <Paperclip className="w-4 h-4 text-indigo-600" />
+                        <span>Attachments ({selectedMessage.attachments.length})</span>
                       </h3>
-                      <div className="flex flex-wrap gap-2">
-                        {selectedMessage.attachments.map((att, idx) => (
-                          <div
-                            key={idx}
-                            className="p-2.5 rounded-lg border border-slate-200 bg-slate-50 flex items-center space-x-2 text-xs"
-                          >
-                            <Mail className="w-4 h-4 text-slate-400" />
-                            <span className="font-medium text-slate-800">{att.filename}</span>
-                            <span className="text-[10px] text-slate-400">
-                              ({(att.size / 1024).toFixed(1)} KB)
-                            </span>
-                          </div>
-                        ))}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                        {selectedMessage.attachments.map((att, idx) => {
+                          const isImage = att.mimeType.startsWith('image/');
+                          const fileHref = att.contentBase64
+                            ? `data:${att.mimeType};base64,${att.contentBase64}`
+                            : '#';
+
+                          return (
+                            <div
+                              key={idx}
+                              className="group relative rounded-xl border border-slate-200 bg-slate-50 p-3 hover:border-indigo-300 hover:shadow-sm transition-all flex flex-col justify-between"
+                            >
+                              <div className="flex items-center space-x-3">
+                                {isImage && att.contentBase64 ? (
+                                  <img
+                                    src={fileHref}
+                                    alt={att.filename}
+                                    className="w-12 h-12 object-cover rounded-lg border border-slate-200"
+                                  />
+                                ) : (
+                                  <div className="w-12 h-12 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center flex-shrink-0">
+                                    <FileText className="w-6 h-6" />
+                                  </div>
+                                )}
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-semibold text-slate-800 truncate" title={att.filename}>
+                                    {att.filename}
+                                  </p>
+                                  <p className="text-[11px] text-slate-400 font-mono">
+                                    {formatFileSize(att.size)}
+                                  </p>
+                                </div>
+                              </div>
+
+                              {att.contentBase64 && (
+                                <a
+                                  href={fileHref}
+                                  download={att.filename}
+                                  className="mt-3 w-full flex items-center justify-center space-x-1.5 py-1.5 px-3 bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 rounded-lg text-xs font-medium text-slate-700 hover:text-indigo-600 transition-colors"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                  <span>Download</span>
+                                </a>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
@@ -611,7 +737,7 @@ export default function MailApp() {
         </main>
       )}
 
-      {/* 4. COMPOSE EMAIL MODAL */}
+      {/* 4. UPGRADED COMPOSE EMAIL MODAL (WITH ATTACHMENTS, IMAGES & LINKS) */}
       {isComposeOpen && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150">
@@ -666,29 +792,147 @@ export default function MailApp() {
                 <input
                   type="text"
                   required
-                  placeholder="Project update / inquiry..."
+                  placeholder="Subject of your email..."
                   value={composeSubject}
                   onChange={(e) => setComposeSubject(e.target.value)}
                   className="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-slate-800"
                 />
               </div>
 
-              {/* Body */}
-              <div className="pt-2">
+              {/* Rich-Text Formatting Toolbar */}
+              <div className="flex items-center justify-between border-y border-slate-200 py-2 bg-slate-50 px-2 rounded-md">
+                <div className="flex items-center space-x-1 text-slate-600">
+                  <button
+                    type="button"
+                    onClick={() => insertFormatting('b')}
+                    className="p-1.5 hover:bg-slate-200 rounded text-slate-700"
+                    title="Bold"
+                  >
+                    <Bold className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => insertFormatting('i')}
+                    className="p-1.5 hover:bg-slate-200 rounded text-slate-700"
+                    title="Italic"
+                  >
+                    <Italic className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => insertFormatting('u')}
+                    className="p-1.5 hover:bg-slate-200 rounded text-slate-700"
+                    title="Underline"
+                  >
+                    <Underline className="w-3.5 h-3.5" />
+                  </button>
+                  <div className="h-4 w-[1px] bg-slate-300 mx-1"></div>
+                  <button
+                    type="button"
+                    onClick={() => setIsLinkModalOpen(true)}
+                    className="flex items-center space-x-1 px-2 py-1 hover:bg-slate-200 rounded text-xs text-indigo-600 font-medium"
+                    title="Add Hyperlink"
+                  >
+                    <LinkIcon className="w-3.5 h-3.5" />
+                    <span>Link</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsImageModalOpen(true)}
+                    className="flex items-center space-x-1 px-2 py-1 hover:bg-slate-200 rounded text-xs text-indigo-600 font-medium"
+                    title="Insert Image by URL"
+                  >
+                    <ImageIcon className="w-3.5 h-3.5" />
+                    <span>Image URL</span>
+                  </button>
+                </div>
+
+                {/* File Attachment Trigger */}
+                <div>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFileChange}
+                    multiple
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex items-center space-x-1.5 px-2.5 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-xs font-medium text-slate-700 transition-colors shadow-sm"
+                  >
+                    <Paperclip className="w-3.5 h-3.5 text-slate-500" />
+                    <span>Attach Files / Photos</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Body Textarea */}
+              <div className="pt-1">
                 <textarea
                   rows={8}
                   required
-                  placeholder="Write your email message here..."
+                  placeholder="Write your email here... (HTML tags like <b>, <i>, and <a> links are supported)"
                   value={composeBody}
                   onChange={(e) => setComposeBody(e.target.value)}
                   className="w-full p-3 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-slate-800 font-sans leading-relaxed"
                 ></textarea>
               </div>
 
+              {/* Attachments Chips Tray in Composer */}
+              {attachments.length > 0 && (
+                <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-2">
+                  <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider flex items-center justify-between">
+                    <span>Attached Items ({attachments.length})</span>
+                    <button
+                      type="button"
+                      onClick={() => setAttachments([])}
+                      className="text-red-500 hover:underline text-[10px]"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {attachments.map((att, idx) => {
+                      const isImage = att.mimeType.startsWith('image/');
+                      return (
+                        <div
+                          key={idx}
+                          className="flex items-center space-x-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs shadow-sm"
+                        >
+                          {isImage && att.contentBase64 ? (
+                            <img
+                              src={`data:${att.mimeType};base64,${att.contentBase64}`}
+                              alt={att.filename}
+                              className="w-5 h-5 object-cover rounded"
+                            />
+                          ) : (
+                            <Paperclip className="w-3.5 h-3.5 text-slate-400" />
+                          )}
+                          <span className="font-medium text-slate-800 max-w-[140px] truncate" title={att.filename}>
+                            {att.filename}
+                          </span>
+                          <span className="text-[10px] text-slate-400 font-mono">
+                            ({formatFileSize(att.size)})
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => removeAttachment(idx)}
+                            className="text-slate-400 hover:text-red-500 p-0.5"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               {/* Footer */}
               <div className="flex items-center justify-between pt-2 border-t border-slate-100">
                 <span className="text-[11px] text-slate-400">
-                  Sent securely via your verified domain infrastructure.
+                  Formatted HTML & attachments will be signed & dispatched.
                 </span>
                 <div className="flex space-x-2">
                   <button
@@ -713,7 +957,125 @@ export default function MailApp() {
         </div>
       )}
 
-      {/* 5. ADD TENANT DOMAIN MODAL */}
+      {/* 5. INSERT LINK MODAL */}
+      {isLinkModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-sm overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="px-4 py-3 bg-slate-900 text-white flex items-center justify-between">
+              <span className="text-xs font-semibold flex items-center space-x-1.5">
+                <LinkIcon className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Insert Hyperlink</span>
+              </span>
+              <button onClick={() => setIsLinkModalOpen(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <form onSubmit={insertLink} className="p-4 space-y-3">
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                  URL / Web Address
+                </label>
+                <input
+                  type="url"
+                  required
+                  placeholder="https://devgeeksnexus.com"
+                  value={linkUrl}
+                  onChange={(e) => setLinkUrl(e.target.value)}
+                  className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                  Display Text (Optional)
+                </label>
+                <input
+                  type="text"
+                  placeholder="Visit DevGeeksNexus"
+                  value={linkText}
+                  onChange={(e) => setLinkText(e.target.value)}
+                  className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                />
+              </div>
+              <div className="flex justify-end space-x-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsLinkModalOpen(false)}
+                  className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg"
+                >
+                  Insert Link
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 6. INSERT IMAGE URL MODAL */}
+      {isImageModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-sm overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="px-4 py-3 bg-slate-900 text-white flex items-center justify-between">
+              <span className="text-xs font-semibold flex items-center space-x-1.5">
+                <ImageIcon className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Insert Image Link</span>
+              </span>
+              <button onClick={() => setIsImageModalOpen(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <form onSubmit={insertImage} className="p-4 space-y-3">
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                  Image URL
+                </label>
+                <input
+                  type="url"
+                  required
+                  placeholder="https://example.com/logo.png"
+                  value={imageUrl}
+                  onChange={(e) => setImageUrl(e.target.value)}
+                  className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                  Alt Text Description (Optional)
+                </label>
+                <input
+                  type="text"
+                  placeholder="Company Logo"
+                  value={imageAlt}
+                  onChange={(e) => setImageAlt(e.target.value)}
+                  className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                />
+              </div>
+              <div className="flex justify-end space-x-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsImageModalOpen(false)}
+                  className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg"
+                >
+                  Insert Image
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 7. ADD TENANT DOMAIN MODAL */}
       {isNewDomainOpen && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-md overflow-hidden animate-in fade-in zoom-in-95 duration-150">
