@@ -5,6 +5,33 @@ export interface Env {
   EMAILS: any; // KVNamespace
 }
 
+export const KNOWN_ACCOUNTS = [
+  {
+    email: 'info@devgeeksnexus.com',
+    name: 'DevGeeksNexus Team',
+    label: 'Info Desk',
+    role: 'Customer & General Inquiries',
+    color: 'indigo',
+    avatar: 'I',
+  },
+  {
+    email: 'ayomidebobani@devgeeksnexus.com',
+    name: 'Ayomide Bobani',
+    label: 'Ayomide Bobani',
+    role: 'Personal & Direct',
+    color: 'emerald',
+    avatar: 'A',
+  },
+  {
+    email: 'admin@devgeeksnexus.com',
+    name: 'Admin | DevGeeksNexus',
+    label: 'Administrator',
+    role: 'System & Admin Alerts',
+    color: 'amber',
+    avatar: '🛡️',
+  },
+];
+
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
@@ -18,6 +45,20 @@ function parseEmailList(input: any): string[] {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function resolveAccount(toStr: string, defaultAcc: string = 'info@devgeeksnexus.com'): string {
+  const lower = (toStr || '').toLowerCase();
+  for (const acc of KNOWN_ACCOUNTS) {
+    if (lower.includes(acc.email.toLowerCase())) {
+      return acc.email;
+    }
+  }
+  if (lower.includes('@devgeeksnexus.com')) {
+    const match = lower.match(/([a-zA-Z0-9._%+-]+@devgeeksnexus\.com)/);
+    if (match) return match[1];
+  }
+  return defaultAcc;
 }
 
 export default {
@@ -34,6 +75,9 @@ export default {
       const fromAddress = message.from || (parsed.from?.address) || 'unknown';
       const ccAddress = (parsed.cc || []).map((c: any) => c.address || c.name).join(', ');
 
+      // Resolve which mailbox this email was sent to
+      const targetAccount = resolveAccount(toAddress);
+
       const attachments = (parsed.attachments || []).map((att: any) => ({
         filename: att.filename || 'attachment',
         mimeType: att.mimeType || 'application/octet-stream',
@@ -44,6 +88,7 @@ export default {
       const msgId = `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
       const payload = {
         id: msgId,
+        account: targetAccount, // Target mailbox (info@, ayomidebobani@, admin@)
         from: fromAddress,
         fromName: parsed.from?.name || fromAddress,
         to: toAddress,
@@ -61,7 +106,7 @@ export default {
 
       if (env.EMAILS) {
         await env.EMAILS.put(`msg:${payload.date}:${msgId}`, JSON.stringify(payload));
-        console.log(`Stored email ${msgId} in Cloudflare KV.`);
+        console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare KV.`);
       }
     } catch (err: any) {
       console.error('Inbound email error:', err.message || err);
@@ -77,33 +122,77 @@ export default {
     const url = new URL(request.url);
 
     // API: GET /api/messages
+    // Supports: ?folder=inbox|sent and ?account=all|info@devgeeksnexus.com|...
     if (url.pathname === '/api/messages') {
       const folder = url.searchParams.get('folder') || 'inbox';
-      const messages: any[] = [];
+      const selectedAccount = (url.searchParams.get('account') || 'all').toLowerCase();
+      const allFetched: any[] = [];
 
       if (env.EMAILS) {
         const list = await env.EMAILS.list({ prefix: 'msg:' });
         for (const key of list.keys) {
           const item = await env.EMAILS.get(key.name, 'json');
           if (item) {
-            if (!folder || item.folder === folder) {
-              messages.push(item);
+            // Normalize account on item if not already set
+            if (!item.account) {
+              item.account = resolveAccount(item.folder === 'sent' ? item.from : item.to);
             }
+            allFetched.push(item);
           }
         }
       }
 
-      messages.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-      return new Response(JSON.stringify({ messages }), {
-        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      // Compute statistics per account for sidebar badges
+      const stats: Record<string, { unread: number; total: number }> = {
+        'all': { unread: 0, total: 0 },
+      };
+      KNOWN_ACCOUNTS.forEach((acc) => {
+        stats[acc.email.toLowerCase()] = { unread: 0, total: 0 };
       });
+
+      for (const item of allFetched) {
+        if (item.folder === 'inbox') {
+          const itemAcc = (item.account || resolveAccount(item.to)).toLowerCase();
+          if (stats[itemAcc]) {
+            stats[itemAcc].total++;
+            if (!item.isRead) stats[itemAcc].unread++;
+          }
+          stats['all'].total++;
+          if (!item.isRead) stats['all'].unread++;
+        }
+      }
+
+      // Filter messages for current view
+      const messages = allFetched.filter((item) => {
+        if (folder && item.folder !== folder) return false;
+        if (selectedAccount !== 'all') {
+          const itemAcc = (item.account || resolveAccount(item.folder === 'sent' ? item.from : item.to)).toLowerCase();
+          const toStr = (item.to || '').toLowerCase();
+          const fromStr = (item.from || '').toLowerCase();
+          return itemAcc === selectedAccount || toStr.includes(selectedAccount) || fromStr.includes(selectedAccount);
+        }
+        return true;
+      });
+
+      messages.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      return new Response(
+        JSON.stringify({
+          messages,
+          stats,
+          accounts: KNOWN_ACCOUNTS,
+        }),
+        {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        }
+      );
     }
 
-    // API: POST /api/send (Sends live via Resend REST API with CC & BCC support)
+    // API: POST /api/send (Sends live via Resend REST API with multi-account support)
     if (request.method === 'POST' && url.pathname === '/api/send') {
       try {
         const body = (await request.json()) as any;
-        const { to, cc, bcc, subject, html, text, attachments } = body;
+        const { from, to, cc, bcc, subject, html, text, attachments } = body;
 
         const toList = parseEmailList(to);
         const ccList = parseEmailList(cc);
@@ -116,8 +205,24 @@ export default {
           });
         }
 
+        // Resolve active sender account
+        let senderEmail = 'info@devgeeksnexus.com';
+        let senderDisplayName = 'DevGeeksNexus Team';
+
+        const matchedAccount = KNOWN_ACCOUNTS.find(
+          (acc) => acc.email.toLowerCase() === (from || '').trim().toLowerCase()
+        );
+
+        if (matchedAccount) {
+          senderEmail = matchedAccount.email;
+          senderDisplayName = matchedAccount.name;
+        } else if (from && from.toLowerCase().endsWith('@devgeeksnexus.com')) {
+          senderEmail = from.trim().toLowerCase();
+          senderDisplayName = senderEmail.split('@')[0];
+        }
+
         const resendPayload: any = {
-          from: 'DevGeeksNexus <info@devgeeksnexus.com>',
+          from: `${senderDisplayName} <${senderEmail}>`,
           to: toList,
           subject: subject || '(No Subject)',
           html: html || (text ? `<p>${text}</p>` : ''),
@@ -153,12 +258,13 @@ export default {
           });
         }
 
-        // Store copy in Sent folder in KV
+        // Store copy in Sent folder in KV tagged with sending account
         const sentId = `sent_${Date.now()}`;
         const sentMsg = {
           id: sentId,
-          from: 'info@devgeeksnexus.com',
-          fromName: 'DevGeeksNexus Team',
+          account: senderEmail,
+          from: senderEmail,
+          fromName: senderDisplayName,
           to: toList.join(', '),
           cc: ccList.join(', '),
           bcc: bccList.join(', '),
@@ -222,7 +328,7 @@ export default {
       }
     }
 
-    // Default: Serve the complete Nexus Mail Web Application with CC / BCC
+    // Default: Serve the complete Nexus Mail Web Application with Multi-Account Switcher
     return new Response(renderWebAppHtml(), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
@@ -235,7 +341,7 @@ function renderWebAppHtml(): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Nexus Mail | info@devgeeksnexus.com</title>
+  <title>Nexus Mail | devgeeksnexus.com</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <style>
@@ -247,35 +353,94 @@ function renderWebAppHtml(): string {
 <body class="bg-slate-50 text-slate-800 h-screen flex overflow-hidden">
 
   <!-- SIDEBAR -->
-  <aside class="w-64 bg-slate-900 text-slate-200 flex flex-col border-r border-slate-800 select-none">
+  <aside class="w-72 bg-slate-900 text-slate-200 flex flex-col border-r border-slate-800 select-none">
+    <!-- Brand Header -->
     <div class="p-4 border-b border-slate-800 flex items-center justify-between">
       <div class="flex items-center space-x-2.5">
         <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/30">N</div>
         <div>
           <h1 class="font-semibold text-sm leading-tight text-white">Nexus Mail</h1>
-          <p class="text-xs text-slate-400">Cloud Mailbox Suite</p>
+          <p class="text-xs text-slate-400">Multi-Account Cloud Suite</p>
         </div>
       </div>
+      <span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-950 text-emerald-400 border border-emerald-800">Live</span>
     </div>
 
-    <!-- Active Mailbox -->
-    <div class="px-4 py-3 bg-slate-800/60 border-b border-slate-800">
-      <span class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">Active Mailbox</span>
-      <div class="flex items-center space-x-2">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span class="text-xs font-mono font-medium text-emerald-300 truncate">info@devgeeksnexus.com</span>
+    <!-- ACCOUNT SWITCHER SECTION -->
+    <div class="p-3 border-b border-slate-800 bg-slate-950/40">
+      <div class="flex items-center justify-between mb-2 px-1">
+        <span class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Mailbox Accounts</span>
+        <span id="active-badge" class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-900/60 text-indigo-300 border border-indigo-700/50">Active</span>
+      </div>
+
+      <div class="space-y-1">
+        <!-- All Mailboxes -->
+        <button onclick="switchAccount('all')" id="acc-all" class="w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all bg-indigo-600/20 text-indigo-300 border border-indigo-500/30">
+          <div class="flex items-center space-x-2.5 truncate">
+            <div class="w-6 h-6 rounded-md bg-slate-800 flex items-center justify-center text-slate-300 text-[11px] font-bold">
+              <i class="fa-solid fa-layer-group text-[10px]"></i>
+            </div>
+            <div class="text-left truncate">
+              <div class="text-xs font-semibold leading-tight">All Mailboxes</div>
+              <div class="text-[10px] text-slate-400">Unified Overview</div>
+            </div>
+          </div>
+          <span id="badge-acc-all" class="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
+        </button>
+
+        <!-- info@devgeeksnexus.com -->
+        <button onclick="switchAccount('info@devgeeksnexus.com')" id="acc-info" class="w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all text-slate-300 hover:bg-slate-800/80">
+          <div class="flex items-center space-x-2.5 truncate">
+            <div class="w-6 h-6 rounded-md bg-indigo-900/60 text-indigo-300 border border-indigo-700/40 flex items-center justify-center text-[11px] font-bold">
+              I
+            </div>
+            <div class="text-left truncate">
+              <div class="text-xs font-semibold leading-tight text-white">Info Desk</div>
+              <div class="text-[10px] text-slate-400 truncate font-mono">info@devgeeksnexus.com</div>
+            </div>
+          </div>
+          <span id="badge-acc-info" class="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
+        </button>
+
+        <!-- ayomidebobani@devgeeksnexus.com -->
+        <button onclick="switchAccount('ayomidebobani@devgeeksnexus.com')" id="acc-ayomide" class="w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all text-slate-300 hover:bg-slate-800/80">
+          <div class="flex items-center space-x-2.5 truncate">
+            <div class="w-6 h-6 rounded-md bg-emerald-900/60 text-emerald-300 border border-emerald-700/40 flex items-center justify-center text-[11px] font-bold">
+              A
+            </div>
+            <div class="text-left truncate">
+              <div class="text-xs font-semibold leading-tight text-white">Ayomide Bobani</div>
+              <div class="text-[10px] text-slate-400 truncate font-mono">ayomidebobani@devgeeksnexus.com</div>
+            </div>
+          </div>
+          <span id="badge-acc-ayomide" class="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
+        </button>
+
+        <!-- admin@devgeeksnexus.com -->
+        <button onclick="switchAccount('admin@devgeeksnexus.com')" id="acc-admin" class="w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all text-slate-300 hover:bg-slate-800/80">
+          <div class="flex items-center space-x-2.5 truncate">
+            <div class="w-6 h-6 rounded-md bg-amber-900/60 text-amber-300 border border-amber-700/40 flex items-center justify-center text-[11px] font-bold">
+              🛡️
+            </div>
+            <div class="text-left truncate">
+              <div class="text-xs font-semibold leading-tight text-white">Administrator</div>
+              <div class="text-[10px] text-slate-400 truncate font-mono">admin@devgeeksnexus.com</div>
+            </div>
+          </div>
+          <span id="badge-acc-admin" class="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
+        </button>
       </div>
     </div>
 
-    <!-- Compose -->
+    <!-- Compose Button -->
     <div class="p-3">
-      <button onclick="openCompose()" class="w-full flex items-center justify-center space-x-2 bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 px-4 rounded-lg shadow-md transition-all active:scale-[0.98]">
+      <button onclick="openCompose()" class="w-full flex items-center justify-center space-x-2 bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 px-4 rounded-lg shadow-md shadow-indigo-600/20 transition-all active:scale-[0.98]">
         <i class="fa-solid fa-plus text-xs"></i>
         <span class="text-sm">Compose Email</span>
       </button>
     </div>
 
-    <!-- Nav -->
+    <!-- Navigation -->
     <nav class="flex-1 px-3 space-y-1 overflow-y-auto">
       <button onclick="switchFolder('inbox')" id="btn-inbox" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium">
         <div class="flex items-center space-x-3">
@@ -287,7 +452,7 @@ function renderWebAppHtml(): string {
 
       <button onclick="switchFolder('sent')" id="btn-sent" class="w-full flex items-center space-x-3 px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
         <i class="fa-solid fa-paper-plane w-4"></i>
-        <span>Sent</span>
+        <span>Sent Messages</span>
       </button>
 
       <button onclick="switchTab('dns')" id="btn-dns" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
@@ -299,9 +464,13 @@ function renderWebAppHtml(): string {
       </button>
     </nav>
 
+    <!-- Footer Status -->
     <div class="p-3 border-t border-slate-800 text-xs text-slate-400 flex items-center justify-between">
-      <span>Cloudflare Worker Live</span>
-      <span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-emerald-400 font-mono">24/7 Cloud</span>
+      <div class="flex items-center space-x-1.5">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span class="text-[11px] text-slate-300">Cloudflare 24/7 Live</span>
+      </div>
+      <span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300 font-mono">KV Storage</span>
     </div>
   </aside>
 
@@ -312,15 +481,21 @@ function renderWebAppHtml(): string {
       <div class="p-3 border-b border-slate-200 flex items-center space-x-2">
         <div class="relative flex-1">
           <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-          <input type="text" id="search-input" oninput="renderList()" placeholder="Search messages..." class="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-100 rounded-lg border-0 focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <input type="text" id="search-input" oninput="renderList()" placeholder="Search in mailbox..." class="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-100 rounded-lg border-0 focus:ring-2 focus:ring-indigo-500 text-slate-800" />
         </div>
         <button onclick="loadMessages()" title="Refresh Mailbox" class="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors">
           <i id="refresh-icon" class="fa-solid fa-rotate-right text-xs"></i>
         </button>
       </div>
 
-      <div class="px-4 py-2 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
-        <span id="folder-title" class="text-xs font-semibold uppercase text-slate-500 tracking-wider">Inbox</span>
+      <!-- Current Filter Header -->
+      <div class="px-4 py-2.5 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
+        <div class="flex items-center space-x-2">
+          <span id="folder-title" class="text-xs font-bold uppercase text-slate-700 tracking-wider">Inbox</span>
+          <span class="text-slate-300 text-xs">•</span>
+          <span id="current-acc-label" class="text-xs font-semibold text-indigo-600 truncate max-w-[150px]">All Mailboxes</span>
+        </div>
+        <span id="list-count-badge" class="text-[11px] text-slate-400 font-mono">0 msgs</span>
       </div>
 
       <div id="email-list" class="flex-1 overflow-y-auto divide-y divide-slate-100 custom-scroll">
@@ -331,16 +506,28 @@ function renderWebAppHtml(): string {
     <!-- Right: Reading Pane -->
     <main class="flex-1 bg-white flex flex-col overflow-hidden">
       <div id="empty-state" class="flex-1 flex flex-col items-center justify-center text-slate-400 p-8">
-        <i class="fa-regular fa-envelope text-4xl mb-3 opacity-30"></i>
-        <p class="text-sm font-medium">Select an email to read</p>
+        <div class="w-16 h-16 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+          <i class="fa-regular fa-envelope text-3xl text-slate-400"></i>
+        </div>
+        <p class="text-sm font-semibold text-slate-700">Select an email to read</p>
+        <p class="text-xs text-slate-400 mt-1">Switch between info@, ayomidebobani@, and admin@ seamlessly.</p>
       </div>
 
       <div id="message-detail" class="hidden flex-1 flex flex-col h-full overflow-hidden">
         <div class="p-4 border-b border-slate-200 flex items-center justify-between bg-slate-50">
-          <button onclick="deleteCurrentMessage()" class="p-1.5 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors" title="Delete">
-            <i class="fa-solid fa-trash-can text-sm"></i>
-          </button>
-          <span id="detail-id" class="text-xs text-slate-400 font-mono"></span>
+          <div class="flex items-center space-x-2">
+            <button onclick="deleteCurrentMessage()" class="p-1.5 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors" title="Delete">
+              <i class="fa-solid fa-trash-can text-sm"></i>
+            </button>
+            <button onclick="replyToCurrentMessage()" class="px-2.5 py-1 bg-white hover:bg-indigo-50 border border-slate-200 rounded text-xs font-medium text-indigo-600 flex items-center space-x-1.5" title="Reply">
+              <i class="fa-solid fa-reply text-xs"></i>
+              <span>Reply</span>
+            </button>
+          </div>
+          <div class="flex items-center space-x-2">
+            <span id="detail-account-badge" class="px-2 py-0.5 rounded text-[11px] font-mono font-medium"></span>
+            <span id="detail-id" class="text-xs text-slate-400 font-mono"></span>
+          </div>
         </div>
 
         <div class="flex-1 overflow-y-auto p-6 custom-scroll">
@@ -351,10 +538,10 @@ function renderWebAppHtml(): string {
                 <div id="detail-avatar" class="w-10 h-10 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold text-sm"></div>
                 <div>
                   <div id="detail-from-name" class="text-sm font-semibold text-slate-900"></div>
-                  <div class="text-xs text-slate-500">From: <span id="detail-from" class="font-mono"></span></div>
-                  <div class="text-xs text-slate-500">To: <span id="detail-to" class="font-mono"></span></div>
-                  <div id="detail-cc-container" class="hidden text-xs text-slate-500">Cc: <span id="detail-cc" class="font-mono"></span></div>
-                  <div id="detail-bcc-container" class="hidden text-xs text-slate-500">Bcc: <span id="detail-bcc" class="font-mono"></span></div>
+                  <div class="text-xs text-slate-500">From: <span id="detail-from" class="font-mono text-slate-700"></span></div>
+                  <div class="text-xs text-slate-500">To: <span id="detail-to" class="font-mono text-slate-700"></span></div>
+                  <div id="detail-cc-container" class="hidden text-xs text-slate-500">Cc: <span id="detail-cc" class="font-mono text-slate-700"></span></div>
+                  <div id="detail-bcc-container" class="hidden text-xs text-slate-500">Bcc: <span id="detail-bcc" class="font-mono text-slate-700"></span></div>
                 </div>
               </div>
               <div id="detail-date" class="text-xs text-slate-400"></div>
@@ -379,20 +566,23 @@ function renderWebAppHtml(): string {
     <div class="max-w-3xl mx-auto space-y-6">
       <div class="flex items-center justify-between">
         <div>
-          <h2 class="text-2xl font-bold text-slate-900">DNS & Domain Verification</h2>
-          <p class="text-sm text-slate-500">Authentication status for <strong>devgeeksnexus.com</strong>.</p>
+          <h2 class="text-2xl font-bold text-slate-900">DNS & Domain Authentication</h2>
+          <p class="text-sm text-slate-500">Configured authentication status for <strong>devgeeksnexus.com</strong>.</p>
         </div>
-        <button onclick="switchTab('mail')" class="px-3 py-1.5 bg-indigo-600 text-white text-xs font-medium rounded-lg">Back to Mailbox</button>
+        <button onclick="switchTab('mail')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg">Back to Mailbox</button>
       </div>
 
       <div class="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
         <div class="flex items-center justify-between pb-3 border-b border-slate-100">
-          <span class="font-mono font-bold text-lg text-slate-900">devgeeksnexus.com</span>
+          <div>
+            <span class="font-mono font-bold text-lg text-slate-900">devgeeksnexus.com</span>
+            <span class="block text-xs text-slate-500">Supports info@, ayomidebobani@, and admin@</span>
+          </div>
           <span class="px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 flex items-center">
-            <i class="fa-solid fa-circle-check mr-1.5 text-emerald-600"></i> 100% Verified
+            <i class="fa-solid fa-circle-check mr-1.5 text-emerald-600"></i> 100% Authenticated
           </span>
         </div>
-        <p class="text-xs text-slate-600">SPF, DKIM, and DMARC are fully authenticated on Cloudflare DNS.</p>
+        <p class="text-xs text-slate-600">SPF, DKIM, and DMARC are verified on Cloudflare and Resend.</p>
         <div class="space-y-2 text-xs font-mono">
           <div class="p-2.5 bg-slate-50 rounded border border-slate-200 flex justify-between">
             <span><strong>SPF:</strong> v=spf1 include:_spf.mx.cloudflare.net include:resend.com ~all</span>
@@ -411,13 +601,13 @@ function renderWebAppHtml(): string {
     </div>
   </div>
 
-  <!-- COMPOSE MODAL (WITH CC / BCC SUPPORT) -->
+  <!-- COMPOSE MODAL (WITH FROM SELECTOR, CC & BCC) -->
   <div id="compose-modal" class="hidden fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
     <div class="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150">
       <div class="px-5 py-3.5 bg-slate-900 text-white flex items-center justify-between">
         <span class="text-sm font-semibold flex items-center space-x-2">
           <i class="fa-solid fa-paper-plane text-indigo-400"></i>
-          <span>New Message</span>
+          <span>New Email Message</span>
         </span>
         <button onclick="closeCompose()" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
       </div>
@@ -425,20 +615,29 @@ function renderWebAppHtml(): string {
       <form onsubmit="handleSend(event)" class="p-5 space-y-3.5">
         <div id="send-alert" class="hidden p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-lg flex items-center space-x-2">
           <i class="fa-solid fa-circle-check text-emerald-600"></i>
-          <span id="send-alert-text">Email sent successfully!</span>
+          <span id="send-alert-text">Email dispatched successfully!</span>
         </div>
 
-        <!-- From -->
+        <!-- From Dropdown Selector -->
         <div class="flex items-center space-x-3 text-xs">
-          <span class="w-14 font-semibold text-slate-500 text-right">From:</span>
-          <span class="font-mono bg-slate-100 text-slate-800 px-2 py-1 rounded border border-slate-200">info@devgeeksnexus.com</span>
-          <span class="text-[11px] text-emerald-600 font-medium">● Verified Sender</span>
+          <label class="w-14 font-semibold text-slate-500 text-right">From:</label>
+          <div class="flex-1 relative">
+            <select id="compose-from" class="w-full px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800 bg-white font-medium cursor-pointer">
+              <option value="info@devgeeksnexus.com">DevGeeksNexus Team &lt;info@devgeeksnexus.com&gt;</option>
+              <option value="ayomidebobani@devgeeksnexus.com">Ayomide Bobani &lt;ayomidebobani@devgeeksnexus.com&gt;</option>
+              <option value="admin@devgeeksnexus.com">Admin | DevGeeksNexus &lt;admin@devgeeksnexus.com&gt;</option>
+            </select>
+          </div>
+          <span class="text-[11px] text-emerald-600 font-medium flex items-center space-x-1">
+            <i class="fa-solid fa-circle-check text-[10px]"></i>
+            <span>Verified</span>
+          </span>
         </div>
 
         <!-- To with CC/BCC toggles -->
         <div class="flex items-center space-x-3 text-xs">
           <label class="w-14 font-semibold text-slate-500 text-right">To:</label>
-          <input type="text" id="compose-to" required placeholder="client@example.com (comma separated for multiple)" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <input type="text" id="compose-to" required placeholder="recipient@example.com (comma separated for multiple)" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
           <div class="flex space-x-1 text-slate-400 text-xs font-semibold">
             <button type="button" onclick="toggleField('cc')" class="px-1.5 py-0.5 rounded hover:bg-slate-100 hover:text-indigo-600">Cc</button>
             <button type="button" onclick="toggleField('bcc')" class="px-1.5 py-0.5 rounded hover:bg-slate-100 hover:text-indigo-600">Bcc</button>
@@ -448,14 +647,14 @@ function renderWebAppHtml(): string {
         <!-- CC (Hidden by default) -->
         <div id="field-cc" class="hidden flex items-center space-x-3 text-xs">
           <label class="w-14 font-semibold text-slate-500 text-right">Cc:</label>
-          <input type="text" id="compose-cc" placeholder="colleague@example.com, manager@example.com" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <input type="text" id="compose-cc" placeholder="colleague@example.com, partner@example.com" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
           <button type="button" onclick="hideField('cc')" class="text-slate-400 hover:text-red-500 px-1"><i class="fa-solid fa-xmark text-xs"></i></button>
         </div>
 
         <!-- BCC (Hidden by default) -->
         <div id="field-bcc" class="hidden flex items-center space-x-3 text-xs">
           <label class="w-14 font-semibold text-slate-500 text-right">Bcc:</label>
-          <input type="text" id="compose-bcc" placeholder="private@example.com, audit@example.com" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <input type="text" id="compose-bcc" placeholder="private@example.com, archive@example.com" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
           <button type="button" onclick="hideField('bcc')" class="text-slate-400 hover:text-red-500 px-1"><i class="fa-solid fa-xmark text-xs"></i></button>
         </div>
 
@@ -465,7 +664,7 @@ function renderWebAppHtml(): string {
           <input type="text" id="compose-subject" required placeholder="Subject of your message..." class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
         </div>
 
-        <!-- Toolbar -->
+        <!-- Formatting & Attachment Toolbar -->
         <div class="flex items-center justify-between border-y border-slate-200 py-2 bg-slate-50 px-2 rounded-md">
           <div class="flex items-center space-x-1">
             <button type="button" onclick="formatText('b')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs font-bold" title="Bold"><i class="fa-solid fa-bold"></i></button>
@@ -477,13 +676,13 @@ function renderWebAppHtml(): string {
             <input type="file" id="file-input" onchange="handleFileSelected(event)" multiple class="hidden" />
             <button type="button" onclick="document.getElementById('file-input').click()" class="flex items-center space-x-1.5 px-2.5 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-xs font-medium text-slate-700 shadow-sm">
               <i class="fa-solid fa-paperclip text-slate-500"></i>
-              <span>Attach Files / Photos</span>
+              <span>Attach Files</span>
             </button>
           </div>
         </div>
 
         <div>
-          <textarea id="compose-body" rows="7" required placeholder="Write your message here... (Formatted HTML and links supported)" class="w-full p-3 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800 font-sans leading-relaxed"></textarea>
+          <textarea id="compose-body" rows="7" required placeholder="Write your message here... (HTML formatting supported)" class="w-full p-3 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800 font-sans leading-relaxed"></textarea>
         </div>
 
         <!-- Attachment Tray -->
@@ -496,7 +695,7 @@ function renderWebAppHtml(): string {
         </div>
 
         <div class="flex items-center justify-between pt-2 border-t border-slate-100">
-          <span class="text-[11px] text-slate-400">Delivered via Resend with CC/BCC tracking.</span>
+          <span class="text-[11px] text-slate-400">Full SPF & DKIM signature applied for all sender accounts.</span>
           <div class="flex space-x-2">
             <button type="button" onclick="closeCompose()" class="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-lg">Cancel</button>
             <button type="submit" id="btn-submit" class="flex items-center space-x-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg shadow-sm">
@@ -512,18 +711,26 @@ function renderWebAppHtml(): string {
   <script>
     let allMessages = [];
     let currentFolder = 'inbox';
+    let currentAccount = 'all'; // 'all' | 'info@devgeeksnexus.com' | 'ayomidebobani@devgeeksnexus.com' | 'admin@devgeeksnexus.com'
     let selectedMsg = null;
     let attachedFiles = [];
+
+    const ACCOUNT_CONFIGS = {
+      'info@devgeeksnexus.com': { name: 'Info Desk', badge: 'bg-indigo-100 text-indigo-700 border-indigo-200', avatar: 'I' },
+      'ayomidebobani@devgeeksnexus.com': { name: 'Ayomide Bobani', badge: 'bg-emerald-100 text-emerald-700 border-emerald-200', avatar: 'A' },
+      'admin@devgeeksnexus.com': { name: 'Admin', badge: 'bg-amber-100 text-amber-700 border-amber-200', avatar: '🛡️' }
+    };
 
     async function loadMessages() {
       const icon = document.getElementById('refresh-icon');
       if (icon) icon.classList.add('fa-spin');
       try {
-        const res = await fetch('/api/messages?folder=' + currentFolder);
+        const url = '/api/messages?folder=' + currentFolder + '&account=' + encodeURIComponent(currentAccount);
+        const res = await fetch(url);
         const data = await res.json();
         allMessages = data.messages || [];
+        updateAccountStats(data.stats);
         renderList();
-        updateUnread();
       } catch (e) {
         console.error('Failed to load messages', e);
       } finally {
@@ -531,18 +738,69 @@ function renderWebAppHtml(): string {
       }
     }
 
+    function updateAccountStats(stats) {
+      if (!stats) return;
+      const allUnread = stats['all'] ? stats['all'].unread : 0;
+      const infoUnread = stats['info@devgeeksnexus.com'] ? stats['info@devgeeksnexus.com'].unread : 0;
+      const ayoUnread = stats['ayomidebobani@devgeeksnexus.com'] ? stats['ayomidebobani@devgeeksnexus.com'].unread : 0;
+      const adminUnread = stats['admin@devgeeksnexus.com'] ? stats['admin@devgeeksnexus.com'].unread : 0;
+
+      document.getElementById('badge-acc-all').textContent = allUnread;
+      document.getElementById('badge-acc-info').textContent = infoUnread;
+      document.getElementById('badge-acc-ayomide').textContent = ayoUnread;
+      document.getElementById('badge-acc-admin').textContent = adminUnread;
+
+      // Active folder badge
+      if (currentAccount === 'all') {
+        document.getElementById('unread-count').textContent = allUnread;
+      } else if (stats[currentAccount.toLowerCase()]) {
+        document.getElementById('unread-count').textContent = stats[currentAccount.toLowerCase()].unread;
+      }
+    }
+
+    function switchAccount(acc) {
+      currentAccount = acc;
+
+      // Update button styling in sidebar
+      const buttons = [
+        { id: 'acc-all', target: 'all', label: 'All Mailboxes' },
+        { id: 'acc-info', target: 'info@devgeeksnexus.com', label: 'Info Desk' },
+        { id: 'acc-ayomide', target: 'ayomidebobani@devgeeksnexus.com', label: 'Ayomide Bobani' },
+        { id: 'acc-admin', target: 'admin@devgeeksnexus.com', label: 'Admin' },
+      ];
+
+      buttons.forEach(b => {
+        const el = document.getElementById(b.id);
+        if (b.target === acc) {
+          el.className = 'w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all bg-indigo-600/20 text-indigo-300 border border-indigo-500/30';
+          document.getElementById('current-acc-label').textContent = b.label;
+        } else {
+          el.className = 'w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all text-slate-300 hover:bg-slate-800/80 border border-transparent';
+        }
+      });
+
+      selectedMsg = null;
+      document.getElementById('message-detail').classList.add('hidden');
+      document.getElementById('empty-state').classList.remove('hidden');
+
+      loadMessages();
+    }
+
     function renderList() {
       const listEl = document.getElementById('email-list');
-      const q = document.getElementById('search-input').value.toLowerCase();
+      const q = (document.getElementById('search-input').value || '').toLowerCase();
       const filtered = allMessages.filter(m => {
         if (!q) return true;
         return (m.subject || '').toLowerCase().includes(q) ||
                (m.from || '').toLowerCase().includes(q) ||
+               (m.to || '').toLowerCase().includes(q) ||
                (m.text || '').toLowerCase().includes(q);
       });
 
+      document.getElementById('list-count-badge').textContent = filtered.length + ' msgs';
+
       if (filtered.length === 0) {
-        listEl.innerHTML = '<div class="p-8 text-center text-slate-400 text-sm"><i class="fa-regular fa-envelope text-3xl mb-2 opacity-30 block"></i>No messages found</div>';
+        listEl.innerHTML = '<div class="p-8 text-center text-slate-400 text-sm"><i class="fa-regular fa-envelope text-3xl mb-2 opacity-30 block"></i>No messages found in this mailbox</div>';
         return;
       }
 
@@ -550,6 +808,20 @@ function renderWebAppHtml(): string {
         const isSelected = selectedMsg && selectedMsg.id === m.id;
         const dateStr = new Date(m.date).toLocaleDateString([], { month: 'short', day: 'numeric' });
         const sender = currentFolder === 'sent' ? 'To: ' + m.to : (m.fromName || m.from);
+        
+        // Account badge pill
+        const accKey = (m.account || (m.folder === 'sent' ? m.from : m.to) || '').toLowerCase();
+        let badgeText = 'info';
+        let badgeClass = 'bg-indigo-50 text-indigo-700 border-indigo-200';
+
+        if (accKey.includes('ayomidebobani')) {
+          badgeText = 'ayomide';
+          badgeClass = 'bg-emerald-50 text-emerald-700 border-emerald-200';
+        } else if (accKey.includes('admin')) {
+          badgeText = 'admin';
+          badgeClass = 'bg-amber-50 text-amber-700 border-amber-200';
+        }
+
         return \`
           <div onclick="selectMessage('\${m.id}')" class="p-3.5 cursor-pointer transition-colors border-l-4 \${
             isSelected ? 'bg-indigo-50/70 border-l-indigo-600' :
@@ -557,14 +829,17 @@ function renderWebAppHtml(): string {
             'bg-indigo-50/30 hover:bg-indigo-50/50 border-l-indigo-500 font-semibold'
           }">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs font-medium text-slate-900 truncate max-w-[200px]">\${escapeHtml(sender)}</span>
+              <span class="text-xs font-medium text-slate-900 truncate max-w-[190px]">\${escapeHtml(sender)}</span>
               <span class="text-[10px] text-slate-400">\${dateStr}</span>
             </div>
             <div class="text-xs font-medium text-slate-800 truncate mb-1">\${escapeHtml(m.subject || '(No Subject)')}</div>
-            <div class="text-xs text-slate-500 line-clamp-2">\${escapeHtml(m.text || '')}</div>
-            <div class="flex items-center justify-between mt-2 pt-1 text-[10px] text-slate-400">
-              \${(m.attachments && m.attachments.length > 0) ? '<span><i class="fa-solid fa-paperclip mr-1"></i>' + m.attachments.length + '</span>' : '<span></span>'}
-              \${!m.isRead ? '<span class="w-2 h-2 rounded-full bg-indigo-600 inline-block"></span>' : ''}
+            <div class="text-xs text-slate-500 line-clamp-2 mb-2">\${escapeHtml(m.text || '')}</div>
+            <div class="flex items-center justify-between pt-1 text-[10px]">
+              <span class="px-1.5 py-0.5 rounded border text-[9px] font-mono font-medium uppercase \${badgeClass}">\${badgeText}</span>
+              <div class="flex items-center space-x-2 text-slate-400">
+                \${(m.attachments && m.attachments.length > 0) ? '<span><i class="fa-solid fa-paperclip mr-1"></i>' + m.attachments.length + '</span>' : ''}
+                \${!m.isRead ? '<span class="w-2 h-2 rounded-full bg-indigo-600 inline-block"></span>' : ''}
+              </div>
             </div>
           </div>
         \`;
@@ -575,15 +850,16 @@ function renderWebAppHtml(): string {
       selectedMsg = allMessages.find(m => m.id === id);
       if (!selectedMsg) return;
 
-      selectedMsg.isRead = true;
-      fetch('/api/messages', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id, isRead: true })
-      });
+      if (!selectedMsg.isRead) {
+        selectedMsg.isRead = true;
+        fetch('/api/messages', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, isRead: true })
+        });
+      }
 
       renderList();
-      updateUnread();
 
       document.getElementById('empty-state').classList.add('hidden');
       document.getElementById('message-detail').classList.remove('hidden');
@@ -593,6 +869,20 @@ function renderWebAppHtml(): string {
       document.getElementById('detail-from-name').textContent = selectedMsg.fromName || selectedMsg.from;
       document.getElementById('detail-from').textContent = selectedMsg.from;
       document.getElementById('detail-to').textContent = selectedMsg.to;
+
+      // Mailbox Badge
+      const accKey = (selectedMsg.account || (selectedMsg.folder === 'sent' ? selectedMsg.from : selectedMsg.to) || '').toLowerCase();
+      const badgeEl = document.getElementById('detail-account-badge');
+      if (accKey.includes('ayomidebobani')) {
+        badgeEl.textContent = 'ayomidebobani@devgeeksnexus.com';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-emerald-100 text-emerald-800 border border-emerald-200';
+      } else if (accKey.includes('admin')) {
+        badgeEl.textContent = 'admin@devgeeksnexus.com';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-amber-100 text-amber-800 border border-amber-200';
+      } else {
+        badgeEl.textContent = 'info@devgeeksnexus.com';
+        badgeEl.className = 'px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-indigo-100 text-indigo-800 border border-indigo-200';
+      }
 
       // Handle CC & BCC in reading pane
       const ccEl = document.getElementById('detail-cc-container');
@@ -643,6 +933,23 @@ function renderWebAppHtml(): string {
       }
     }
 
+    function replyToCurrentMessage() {
+      if (!selectedMsg) return;
+      openCompose();
+      document.getElementById('compose-to').value = selectedMsg.from;
+      document.getElementById('compose-subject').value = selectedMsg.subject.startsWith('Re:') ? selectedMsg.subject : 'Re: ' + selectedMsg.subject;
+      
+      // Auto-select which account received this message as the "From" sender
+      const accKey = (selectedMsg.account || selectedMsg.to || '').toLowerCase();
+      if (accKey.includes('ayomidebobani')) {
+        document.getElementById('compose-from').value = 'ayomidebobani@devgeeksnexus.com';
+      } else if (accKey.includes('admin')) {
+        document.getElementById('compose-from').value = 'admin@devgeeksnexus.com';
+      } else {
+        document.getElementById('compose-from').value = 'info@devgeeksnexus.com';
+      }
+    }
+
     async function deleteCurrentMessage() {
       if (!selectedMsg) return;
       await fetch('/api/messages', {
@@ -655,7 +962,6 @@ function renderWebAppHtml(): string {
       document.getElementById('message-detail').classList.add('hidden');
       document.getElementById('empty-state').classList.remove('hidden');
       renderList();
-      updateUnread();
     }
 
     function switchFolder(f) {
@@ -677,11 +983,6 @@ function renderWebAppHtml(): string {
       }
     }
 
-    function updateUnread() {
-      const unread = allMessages.filter(m => !m.isRead).length;
-      document.getElementById('unread-count').textContent = unread;
-    }
-
     // TOGGLE CC & BCC
     function toggleField(type) {
       const el = document.getElementById('field-' + type);
@@ -700,6 +1001,10 @@ function renderWebAppHtml(): string {
 
     // COMPOSE & ATTACHMENTS
     function openCompose() {
+      // Set compose From to currently selected account if specific
+      if (currentAccount !== 'all') {
+        document.getElementById('compose-from').value = currentAccount;
+      }
       document.getElementById('compose-modal').classList.remove('hidden');
     }
     function closeCompose() {
@@ -777,6 +1082,7 @@ function renderWebAppHtml(): string {
       btn.disabled = true;
       btnText.textContent = 'Sending...';
 
+      const from = document.getElementById('compose-from').value;
       const to = document.getElementById('compose-to').value;
       const cc = document.getElementById('compose-cc').value;
       const bcc = document.getElementById('compose-bcc').value;
@@ -788,6 +1094,7 @@ function renderWebAppHtml(): string {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            from,
             to,
             cc,
             bcc,
@@ -834,9 +1141,9 @@ function renderWebAppHtml(): string {
       return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
-    // Auto-load on page load
+    // Initial load & periodic refresh
     loadMessages();
-    setInterval(loadMessages, 15000); // Polling every 15s
+    setInterval(loadMessages, 15000);
   </script>
 </body>
 </html>`;

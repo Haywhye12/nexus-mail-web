@@ -40,6 +40,7 @@ export interface Message {
   id: string;
   tenantId: string;
   mailboxId: string;
+  account?: string; // e.g. "info@devgeeksnexus.com", "ayomidebobani@devgeeksnexus.com", "admin@devgeeksnexus.com"
   folder: 'inbox' | 'sent' | 'drafts' | 'trash';
   from: string;
   fromName?: string;

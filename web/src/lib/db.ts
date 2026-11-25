@@ -77,6 +77,22 @@ const INITIAL_DATA: DatabaseSchema = {
       name: 'DevGeeksNexus Info Desk',
       createdAt: new Date().toISOString(),
     },
+    {
+      id: 'mbox_2',
+      tenantId: 'tenant_1',
+      domainId: 'dom_1',
+      email: 'ayomidebobani@devgeeksnexus.com',
+      name: 'Ayomide Bobani',
+      createdAt: new Date().toISOString(),
+    },
+    {
+      id: 'mbox_3',
+      tenantId: 'tenant_1',
+      domainId: 'dom_1',
+      email: 'admin@devgeeksnexus.com',
+      name: 'DevGeeksNexus Admin',
+      createdAt: new Date().toISOString(),
+    },
   ],
   messages: [
     {
