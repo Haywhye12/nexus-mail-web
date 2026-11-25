@@ -11,6 +11,15 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
+function parseEmailList(input: any): string[] {
+  if (!input) return [];
+  if (Array.isArray(input)) return input.map((s) => String(s).trim()).filter(Boolean);
+  return String(input)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export default {
   // 1. INBOUND EMAIL EVENT HANDLER (Cloudflare Email Routing)
   async email(message: any, env: Env, ctx: any): Promise<void> {
@@ -23,6 +32,7 @@ export default {
 
       const toAddress = message.to || (parsed.to && parsed.to[0]?.address) || 'info@devgeeksnexus.com';
       const fromAddress = message.from || (parsed.from?.address) || 'unknown';
+      const ccAddress = (parsed.cc || []).map((c: any) => c.address || c.name).join(', ');
 
       const attachments = (parsed.attachments || []).map((att: any) => ({
         filename: att.filename || 'attachment',
@@ -37,6 +47,7 @@ export default {
         from: fromAddress,
         fromName: parsed.from?.name || fromAddress,
         to: toAddress,
+        cc: ccAddress,
         subject: parsed.subject || '(No Subject)',
         text: parsed.text || '',
         html: parsed.html || (parsed.text ? `<pre>${parsed.text}</pre>` : ''),
@@ -88,18 +99,32 @@ export default {
       });
     }
 
-    // API: POST /api/send (Sends live via Resend REST API)
+    // API: POST /api/send (Sends live via Resend REST API with CC & BCC support)
     if (request.method === 'POST' && url.pathname === '/api/send') {
       try {
         const body = (await request.json()) as any;
-        const { to, subject, html, text, attachments } = body;
+        const { to, cc, bcc, subject, html, text, attachments } = body;
+
+        const toList = parseEmailList(to);
+        const ccList = parseEmailList(cc);
+        const bccList = parseEmailList(bcc);
+
+        if (toList.length === 0) {
+          return new Response(JSON.stringify({ error: 'At least one recipient "to" address is required.' }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
 
         const resendPayload: any = {
           from: 'DevGeeksNexus <info@devgeeksnexus.com>',
-          to: Array.isArray(to) ? to : [to],
+          to: toList,
           subject: subject || '(No Subject)',
           html: html || (text ? `<p>${text}</p>` : ''),
         };
+
+        if (ccList.length > 0) resendPayload.cc = ccList;
+        if (bccList.length > 0) resendPayload.bcc = bccList;
 
         if (attachments && attachments.length > 0) {
           resendPayload.attachments = attachments.map((att: any) => ({
@@ -109,10 +134,11 @@ export default {
         }
 
         // Call Resend REST API
+        const apiKey = env.RESEND_API_KEY;
         const resendRes = await fetch('https://api.resend.com/emails', {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${env.RESEND_API_KEY}`,
+            Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(resendPayload),
@@ -133,7 +159,9 @@ export default {
           id: sentId,
           from: 'info@devgeeksnexus.com',
           fromName: 'DevGeeksNexus Team',
-          to,
+          to: toList.join(', '),
+          cc: ccList.join(', '),
+          bcc: bccList.join(', '),
           subject,
           text: text || '',
           html: html || '',
@@ -194,7 +222,7 @@ export default {
       }
     }
 
-    // Default: Serve the complete Nexus Mail Web Application
+    // Default: Serve the complete Nexus Mail Web Application with CC / BCC
     return new Response(renderWebAppHtml(), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
@@ -325,6 +353,8 @@ function renderWebAppHtml(): string {
                   <div id="detail-from-name" class="text-sm font-semibold text-slate-900"></div>
                   <div class="text-xs text-slate-500">From: <span id="detail-from" class="font-mono"></span></div>
                   <div class="text-xs text-slate-500">To: <span id="detail-to" class="font-mono"></span></div>
+                  <div id="detail-cc-container" class="hidden text-xs text-slate-500">Cc: <span id="detail-cc" class="font-mono"></span></div>
+                  <div id="detail-bcc-container" class="hidden text-xs text-slate-500">Bcc: <span id="detail-bcc" class="font-mono"></span></div>
                 </div>
               </div>
               <div id="detail-date" class="text-xs text-slate-400"></div>
@@ -381,9 +411,9 @@ function renderWebAppHtml(): string {
     </div>
   </div>
 
-  <!-- COMPOSE MODAL -->
+  <!-- COMPOSE MODAL (WITH CC / BCC SUPPORT) -->
   <div id="compose-modal" class="hidden fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-    <div class="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col">
+    <div class="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-150">
       <div class="px-5 py-3.5 bg-slate-900 text-white flex items-center justify-between">
         <span class="text-sm font-semibold flex items-center space-x-2">
           <i class="fa-solid fa-paper-plane text-indigo-400"></i>
@@ -392,23 +422,44 @@ function renderWebAppHtml(): string {
         <button onclick="closeCompose()" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
       </div>
 
-      <form onsubmit="handleSend(event)" class="p-5 space-y-4">
+      <form onsubmit="handleSend(event)" class="p-5 space-y-3.5">
         <div id="send-alert" class="hidden p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-lg flex items-center space-x-2">
           <i class="fa-solid fa-circle-check text-emerald-600"></i>
           <span id="send-alert-text">Email sent successfully!</span>
         </div>
 
+        <!-- From -->
         <div class="flex items-center space-x-3 text-xs">
           <span class="w-14 font-semibold text-slate-500 text-right">From:</span>
           <span class="font-mono bg-slate-100 text-slate-800 px-2 py-1 rounded border border-slate-200">info@devgeeksnexus.com</span>
           <span class="text-[11px] text-emerald-600 font-medium">● Verified Sender</span>
         </div>
 
+        <!-- To with CC/BCC toggles -->
         <div class="flex items-center space-x-3 text-xs">
           <label class="w-14 font-semibold text-slate-500 text-right">To:</label>
-          <input type="email" id="compose-to" required placeholder="client@example.com" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <input type="text" id="compose-to" required placeholder="client@example.com (comma separated for multiple)" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <div class="flex space-x-1 text-slate-400 text-xs font-semibold">
+            <button type="button" onclick="toggleField('cc')" class="px-1.5 py-0.5 rounded hover:bg-slate-100 hover:text-indigo-600">Cc</button>
+            <button type="button" onclick="toggleField('bcc')" class="px-1.5 py-0.5 rounded hover:bg-slate-100 hover:text-indigo-600">Bcc</button>
+          </div>
         </div>
 
+        <!-- CC (Hidden by default) -->
+        <div id="field-cc" class="hidden flex items-center space-x-3 text-xs">
+          <label class="w-14 font-semibold text-slate-500 text-right">Cc:</label>
+          <input type="text" id="compose-cc" placeholder="colleague@example.com, manager@example.com" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <button type="button" onclick="hideField('cc')" class="text-slate-400 hover:text-red-500 px-1"><i class="fa-solid fa-xmark text-xs"></i></button>
+        </div>
+
+        <!-- BCC (Hidden by default) -->
+        <div id="field-bcc" class="hidden flex items-center space-x-3 text-xs">
+          <label class="w-14 font-semibold text-slate-500 text-right">Bcc:</label>
+          <input type="text" id="compose-bcc" placeholder="private@example.com, audit@example.com" class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          <button type="button" onclick="hideField('bcc')" class="text-slate-400 hover:text-red-500 px-1"><i class="fa-solid fa-xmark text-xs"></i></button>
+        </div>
+
+        <!-- Subject -->
         <div class="flex items-center space-x-3 text-xs">
           <label class="w-14 font-semibold text-slate-500 text-right">Subject:</label>
           <input type="text" id="compose-subject" required placeholder="Subject of your message..." class="flex-1 px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
@@ -432,7 +483,7 @@ function renderWebAppHtml(): string {
         </div>
 
         <div>
-          <textarea id="compose-body" rows="8" required placeholder="Write your message here... (Formatted HTML and links supported)" class="w-full p-3 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800 font-sans leading-relaxed"></textarea>
+          <textarea id="compose-body" rows="7" required placeholder="Write your message here... (Formatted HTML and links supported)" class="w-full p-3 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800 font-sans leading-relaxed"></textarea>
         </div>
 
         <!-- Attachment Tray -->
@@ -445,7 +496,7 @@ function renderWebAppHtml(): string {
         </div>
 
         <div class="flex items-center justify-between pt-2 border-t border-slate-100">
-          <span class="text-[11px] text-slate-400">Dispatched via Resend API from Cloudflare.</span>
+          <span class="text-[11px] text-slate-400">Delivered via Resend with CC/BCC tracking.</span>
           <div class="flex space-x-2">
             <button type="button" onclick="closeCompose()" class="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-lg">Cancel</button>
             <button type="submit" id="btn-submit" class="flex items-center space-x-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg shadow-sm">
@@ -542,6 +593,24 @@ function renderWebAppHtml(): string {
       document.getElementById('detail-from-name').textContent = selectedMsg.fromName || selectedMsg.from;
       document.getElementById('detail-from').textContent = selectedMsg.from;
       document.getElementById('detail-to').textContent = selectedMsg.to;
+
+      // Handle CC & BCC in reading pane
+      const ccEl = document.getElementById('detail-cc-container');
+      if (selectedMsg.cc) {
+        ccEl.classList.remove('hidden');
+        document.getElementById('detail-cc').textContent = selectedMsg.cc;
+      } else {
+        ccEl.classList.add('hidden');
+      }
+
+      const bccEl = document.getElementById('detail-bcc-container');
+      if (selectedMsg.bcc) {
+        bccEl.classList.remove('hidden');
+        document.getElementById('detail-bcc').textContent = selectedMsg.bcc;
+      } else {
+        bccEl.classList.add('hidden');
+      }
+
       document.getElementById('detail-date').textContent = new Date(selectedMsg.date).toLocaleString();
       document.getElementById('detail-avatar').textContent = (selectedMsg.fromName || selectedMsg.from).charAt(0).toUpperCase();
       document.getElementById('detail-body').innerHTML = selectedMsg.html || escapeHtml(selectedMsg.text);
@@ -611,6 +680,22 @@ function renderWebAppHtml(): string {
     function updateUnread() {
       const unread = allMessages.filter(m => !m.isRead).length;
       document.getElementById('unread-count').textContent = unread;
+    }
+
+    // TOGGLE CC & BCC
+    function toggleField(type) {
+      const el = document.getElementById('field-' + type);
+      if (el) {
+        el.classList.remove('hidden');
+        document.getElementById('compose-' + type).focus();
+      }
+    }
+    function hideField(type) {
+      const el = document.getElementById('field-' + type);
+      if (el) {
+        el.classList.add('hidden');
+        document.getElementById('compose-' + type).value = '';
+      }
     }
 
     // COMPOSE & ATTACHMENTS
@@ -693,6 +778,8 @@ function renderWebAppHtml(): string {
       btnText.textContent = 'Sending...';
 
       const to = document.getElementById('compose-to').value;
+      const cc = document.getElementById('compose-cc').value;
+      const bcc = document.getElementById('compose-bcc').value;
       const subject = document.getElementById('compose-subject').value;
       const body = document.getElementById('compose-body').value;
 
@@ -702,6 +789,8 @@ function renderWebAppHtml(): string {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             to,
+            cc,
+            bcc,
             subject,
             text: body.replace(/<[^>]*>?/gm, ''),
             html: '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + body.replace(/\\n/g, '<br/>') + '</div>',
@@ -715,8 +804,12 @@ function renderWebAppHtml(): string {
           setTimeout(() => {
             closeCompose();
             document.getElementById('compose-to').value = '';
+            document.getElementById('compose-cc').value = '';
+            document.getElementById('compose-bcc').value = '';
             document.getElementById('compose-subject').value = '';
             document.getElementById('compose-body').value = '';
+            hideField('cc');
+            hideField('bcc');
             clearAttachments();
             loadMessages();
           }, 1500);

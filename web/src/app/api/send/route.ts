@@ -6,7 +6,7 @@ import { Message, Attachment } from '@/lib/types';
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { from, fromName, to, subject, text, html, mailboxId, tenantId, attachments } = body;
+    const { from, fromName, to, cc, bcc, subject, text, html, mailboxId, tenantId, attachments } = body;
 
     if (!from || !to || !subject) {
       return NextResponse.json({ error: 'Missing from, to, or subject' }, { status: 400 });
@@ -14,11 +14,13 @@ export async function POST(req: NextRequest) {
 
     const cleanAttachments: Attachment[] = Array.isArray(attachments) ? attachments : [];
 
-    // 1. Dispatch through email delivery transport
+    // 1. Dispatch through email delivery transport with CC and BCC
     const sendResult = await sendMail({
       from,
       fromName: fromName || 'DevGeeksNexus Team',
       to,
+      cc,
+      bcc,
       subject,
       text,
       html,
@@ -33,7 +35,9 @@ export async function POST(req: NextRequest) {
       folder: 'sent',
       from,
       fromName: fromName || 'DevGeeksNexus Team',
-      to,
+      to: Array.isArray(to) ? to.join(', ') : to,
+      cc: Array.isArray(cc) ? cc.join(', ') : (cc || undefined),
+      bcc: Array.isArray(bcc) ? bcc.join(', ') : (bcc || undefined),
       subject,
       text: text || '',
       html: html || (text ? `<p>${text}</p>` : ''),

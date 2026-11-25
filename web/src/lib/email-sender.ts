@@ -4,7 +4,9 @@ import { Attachment } from './types';
 export interface SendMailOptions {
   from: string;
   fromName?: string;
-  to: string;
+  to: string | string[];
+  cc?: string | string[];
+  bcc?: string | string[];
   subject: string;
   text?: string;
   html?: string;
@@ -12,7 +14,7 @@ export interface SendMailOptions {
 }
 
 export async function sendMail(options: SendMailOptions) {
-  const { from, fromName, to, subject, text, html, attachments } = options;
+  const { from, fromName, to, cc, bcc, subject, text, html, attachments } = options;
 
   // Check if SMTP environment credentials exist (e.g. Brevo, Resend, Amazon SES, or custom SMTP)
   const smtpHost = process.env.SMTP_HOST;
@@ -37,14 +39,19 @@ export async function sendMail(options: SendMailOptions) {
       },
     });
 
-    const info = await transporter.sendMail({
+    const mailOptions: any = {
       from: fromName ? `"${fromName}" <${from}>` : from,
       to,
       subject,
       text: text || '',
       html: html || (text ? `<p>${text}</p>` : ''),
       attachments: formattedAttachments,
-    });
+    };
+
+    if (cc) mailOptions.cc = cc;
+    if (bcc) mailOptions.bcc = bcc;
+
+    const info = await transporter.sendMail(mailOptions);
 
     return {
       success: true,
@@ -55,12 +62,12 @@ export async function sendMail(options: SendMailOptions) {
 
   // Development / Simulation mode (when running locally or before SMTP secrets are added)
   console.log(
-    `[OUTBOUND SIMULATION] Sent email from: ${from} to: ${to} - Subject: ${subject} - Attachments: ${attachments?.length || 0}`
+    `[OUTBOUND SIMULATION] Sent email from: ${from} to: ${to} (cc: ${cc || 'none'}, bcc: ${bcc || 'none'}) - Subject: ${subject} - Attachments: ${attachments?.length || 0}`
   );
   return {
     success: true,
     mode: 'simulation',
-    messageId: `<sim_${Date.now()}@${from.split('@')[1] || 'devgeeksnexus.com'}>`,
+    messageId: `<sim_${Date.now()}@${String(from).split('@')[1] || 'devgeeksnexus.com'}>`,
     note: 'Email simulated in development mode. Set SMTP_HOST, SMTP_USER, SMTP_PASS in .env.local to send live.',
   };
 }

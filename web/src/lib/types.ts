@@ -44,6 +44,8 @@ export interface Message {
   from: string;
   fromName?: string;
   to: string;
+  cc?: string;
+  bcc?: string;
   subject: string;
   text: string;
   html: string;
