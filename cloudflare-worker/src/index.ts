@@ -419,7 +419,7 @@ export default {
       }
     }
 
-    // Default: Serve the complete Nexus Mail Web Application (Mobile-Responsive + Drafts)
+    // Default: Serve the complete Nexus Suite (Mail + Google Meet-like Video Training)
     return new Response(renderWebAppHtml(), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
@@ -432,9 +432,11 @@ function renderWebAppHtml(): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Nexus Mail | devgeeksnexus.com</title>
+  <title>Nexus Suite | Mail & Video Training Meetings</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <!-- Jitsi Meet WebRTC Video & Screen Share Engine -->
+  <script src="https://meet.jit.si/external_api.js"></script>
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -453,18 +455,22 @@ function renderWebAppHtml(): string {
   <!-- MOBILE TOPBAR -->
   <header class="md:hidden h-14 bg-slate-900 text-white flex items-center justify-between px-3.5 border-b border-slate-800 flex-shrink-0 z-30 shadow-sm">
     <div class="flex items-center space-x-2.5">
-      <button onclick="toggleSidebar(true)" class="p-2 -ml-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 active:scale-90 transition-all" aria-label="Open Mailboxes">
+      <button onclick="toggleSidebar(true)" class="p-2 -ml-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 active:scale-90 transition-all" aria-label="Open Menu">
         <i class="fa-solid fa-bars text-lg"></i>
       </button>
       <div class="flex items-center space-x-2">
         <div class="w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white text-xs shadow-md shadow-indigo-600/30">N</div>
         <div class="leading-tight">
-          <h1 class="font-semibold text-xs text-white">Nexus Mail</h1>
-          <span id="mobile-top-account" class="text-[10px] text-indigo-300 font-mono block truncate max-w-[150px]">All Mailboxes</span>
+          <h1 class="font-semibold text-xs text-white">Nexus Suite</h1>
+          <span id="mobile-top-account" class="text-[10px] text-indigo-300 font-mono block truncate max-w-[140px]">All Mailboxes</span>
         </div>
       </div>
     </div>
     <div class="flex items-center space-x-1.5">
+      <!-- Quick Meet button on mobile -->
+      <button onclick="switchTab('meet')" class="p-2 text-rose-400 hover:text-rose-300 rounded-lg hover:bg-slate-800 active:scale-95 transition-all" title="Nexus Meet">
+        <i class="fa-solid fa-video text-xs"></i>
+      </button>
       <button onclick="loadMessages()" class="p-2 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 active:rotate-180 transition-all" title="Refresh">
         <i id="mobile-refresh-icon" class="fa-solid fa-rotate-right text-xs"></i>
       </button>
@@ -485,8 +491,8 @@ function renderWebAppHtml(): string {
       <div class="flex items-center space-x-2.5">
         <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/30">N</div>
         <div>
-          <h1 class="font-semibold text-sm leading-tight text-white">Nexus Mail</h1>
-          <p class="text-xs text-slate-400">Multi-Account Cloud Suite</p>
+          <h1 class="font-semibold text-sm leading-tight text-white">Nexus Suite</h1>
+          <p class="text-xs text-slate-400">Mail & Video Training</p>
         </div>
       </div>
       <div class="flex items-center space-x-2">
@@ -600,6 +606,19 @@ function renderWebAppHtml(): string {
         <span id="sent-count" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
       </button>
 
+      <div class="pt-2 pb-1 px-3">
+        <div class="border-t border-slate-800"></div>
+      </div>
+
+      <!-- Nexus Meet (Video Training & Screen Sharing) -->
+      <button onclick="switchTab('meet')" id="btn-meet" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid fa-video w-4 text-rose-400"></i>
+          <span class="font-medium">Nexus Meet</span>
+        </div>
+        <span class="px-1.5 py-0.2 rounded text-[9px] bg-rose-950 text-rose-300 border border-rose-800/60 font-semibold uppercase">Live</span>
+      </button>
+
       <!-- DNS -->
       <button onclick="switchTab('dns')" id="btn-dns" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
         <div class="flex items-center space-x-3">
@@ -620,7 +639,7 @@ function renderWebAppHtml(): string {
     </div>
   </aside>
 
-  <!-- MAIN APP CONTAINER -->
+  <!-- MAIN APP CONTAINER (MAIL VIEW) -->
   <div id="mail-view" class="flex-1 flex flex-col md:flex-row overflow-hidden relative">
     
     <!-- Email List Section -->
@@ -658,7 +677,7 @@ function renderWebAppHtml(): string {
           <i class="fa-regular fa-envelope text-3xl text-slate-400"></i>
         </div>
         <p class="text-sm font-semibold text-slate-700">Select an email to read</p>
-        <p class="text-xs text-slate-400 mt-1">Multi-account routing & drafts active.</p>
+        <p class="text-xs text-slate-400 mt-1">Multi-account routing & video meetings active.</p>
       </div>
 
       <!-- Email Detail Container -->
@@ -726,6 +745,152 @@ function renderWebAppHtml(): string {
     <button onclick="openCompose()" class="md:hidden fixed bottom-5 right-5 w-13 h-13 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl shadow-indigo-600/40 flex items-center justify-center text-lg z-30 active:scale-90 transition-all" aria-label="Compose New Email">
       <i class="fa-solid fa-plus text-xl"></i>
     </button>
+  </div>
+
+  <!-- NEXUS MEET VIEW (GOOGLE MEET-LIKE VIDEO TRAINING & SCREEN SHARING) -->
+  <div id="meet-view" class="hidden flex-1 flex flex-col bg-slate-900 overflow-hidden relative">
+    
+    <!-- LOBBY / HUB VIEW -->
+    <div id="meet-lobby" class="flex-1 overflow-y-auto p-4 sm:p-8 flex items-center justify-center custom-scroll touch-scroll">
+      <div class="max-w-2xl w-full space-y-6">
+        
+        <!-- Header -->
+        <div class="text-center space-y-2">
+          <div class="inline-flex items-center space-x-2 px-3 py-1 rounded-full bg-rose-950/80 border border-rose-800/60 text-rose-300 text-xs font-semibold mb-1">
+            <span class="w-2 h-2 rounded-full bg-rose-500 animate-ping"></span>
+            <span>Nexus Meet • Video Calls & Screen Sharing</span>
+          </div>
+          <h2 class="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">Team Video Training & Collaboration</h2>
+          <p class="text-xs sm:text-sm text-slate-400 max-w-lg mx-auto">
+            Host live training sessions, share your screen in high definition, chat, and collaborate with zero software downloads.
+          </p>
+        </div>
+
+        <!-- Action Cards Grid -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <!-- Instant Meeting Card -->
+          <div class="bg-slate-800/80 border border-slate-750 rounded-2xl p-5 flex flex-col justify-between hover:border-indigo-500/50 transition-all shadow-lg">
+            <div class="space-y-3">
+              <div class="w-10 h-10 rounded-xl bg-indigo-600/20 text-indigo-400 flex items-center justify-center text-lg">
+                <i class="fa-solid fa-video"></i>
+              </div>
+              <div>
+                <h3 class="text-sm font-bold text-white">Start Instant Training Call</h3>
+                <p class="text-xs text-slate-400 mt-0.5">Generate a secure room with camera, audio & screen sharing.</p>
+              </div>
+            </div>
+            <button onclick="startInstantMeeting()" class="mt-4 w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center justify-center space-x-2 shadow-md shadow-indigo-600/30 active:scale-95 transition-all">
+              <i class="fa-solid fa-play text-xs"></i>
+              <span>Start New Meeting</span>
+            </button>
+          </div>
+
+          <!-- Join with Code Card -->
+          <div class="bg-slate-800/80 border border-slate-750 rounded-2xl p-5 flex flex-col justify-between hover:border-rose-500/50 transition-all shadow-lg">
+            <div class="space-y-3">
+              <div class="w-10 h-10 rounded-xl bg-rose-600/20 text-rose-400 flex items-center justify-center text-lg">
+                <i class="fa-solid fa-keyboard"></i>
+              </div>
+              <div>
+                <h3 class="text-sm font-bold text-white">Join with a Code or Link</h3>
+                <p class="text-xs text-slate-400 mt-0.5">Enter a room code or paste an invitation link to enter an active training.</p>
+              </div>
+            </div>
+            <form onsubmit="handleJoinCode(event)" class="mt-4 flex space-x-2">
+              <input type="text" id="join-room-input" placeholder="e.g. devgeeksnexus-training" required class="flex-1 px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white placeholder-slate-500 focus:ring-2 focus:ring-rose-500" />
+              <button type="submit" class="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-semibold active:scale-95 transition-all">Join</button>
+            </form>
+          </div>
+        </div>
+
+        <!-- Permanent Organization Rooms -->
+        <div class="bg-slate-800/50 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-3">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center space-x-1.5">
+              <i class="fa-solid fa-bookmark text-indigo-400"></i>
+              <span>Permanent Organization Rooms</span>
+            </span>
+            <span class="text-[10px] text-slate-500 font-mono">devgeeksnexus.com</span>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <div class="p-3 bg-slate-900/60 rounded-xl border border-slate-750 flex items-center justify-between hover:border-slate-600 transition-colors">
+              <div class="truncate mr-2">
+                <p class="text-xs font-semibold text-white truncate">DevGeeks Training Room</p>
+                <p class="text-[10px] text-slate-400 font-mono truncate">devgeeksnexus-training</p>
+              </div>
+              <button onclick="joinRoom('devgeeksnexus-training')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg active:scale-95 transition-all">Enter</button>
+            </div>
+
+            <div class="p-3 bg-slate-900/60 rounded-xl border border-slate-750 flex items-center justify-between hover:border-slate-600 transition-colors">
+              <div class="truncate mr-2">
+                <p class="text-xs font-semibold text-white truncate">Tech & Code Review</p>
+                <p class="text-[10px] text-slate-400 font-mono truncate">devgeeksnexus-tech</p>
+              </div>
+              <button onclick="joinRoom('devgeeksnexus-tech')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg active:scale-95 transition-all">Enter</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Features Overview Pills -->
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-slate-400 text-[11px]">
+          <div class="p-2.5 bg-slate-800/40 rounded-xl border border-slate-800 flex flex-col items-center">
+            <i class="fa-solid fa-desktop text-emerald-400 mb-1 text-sm"></i>
+            <span>Screen Sharing</span>
+          </div>
+          <div class="p-2.5 bg-slate-800/40 rounded-xl border border-slate-800 flex flex-col items-center">
+            <i class="fa-solid fa-video text-indigo-400 mb-1 text-sm"></i>
+            <span>HD Video & Audio</span>
+          </div>
+          <div class="p-2.5 bg-slate-800/40 rounded-xl border border-slate-800 flex flex-col items-center">
+            <i class="fa-solid fa-comments text-rose-400 mb-1 text-sm"></i>
+            <span>Live Group Chat</span>
+          </div>
+          <div class="p-2.5 bg-slate-800/40 rounded-xl border border-slate-800 flex flex-col items-center">
+            <i class="fa-solid fa-hand text-amber-400 mb-1 text-sm"></i>
+            <span>Hand Raising</span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ACTIVE MEETING STAGE -->
+    <div id="meet-active-stage" class="hidden flex-1 flex flex-col h-full bg-slate-950 overflow-hidden">
+      <!-- Top Action Bar inside active meeting -->
+      <div class="h-12 bg-slate-900/90 border-b border-slate-800 px-3 sm:px-4 flex items-center justify-between flex-shrink-0 z-20">
+        <div class="flex items-center space-x-2.5 truncate">
+          <div class="w-3 h-3 rounded-full bg-rose-500 animate-pulse"></div>
+          <span id="active-room-title" class="text-xs sm:text-sm font-bold text-white font-mono truncate">devgeeksnexus-room</span>
+        </div>
+
+        <div class="flex items-center space-x-1.5 sm:space-x-2">
+          <!-- Copy Invite Link -->
+          <button onclick="copyMeetingLink()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium rounded-lg flex items-center space-x-1.5 active:scale-95 transition-all" title="Copy Invite Link">
+            <i class="fa-solid fa-link text-[10px]"></i>
+            <span class="hidden sm:inline" id="copy-link-text">Copy Link</span>
+          </button>
+
+          <!-- Invite by Email -->
+          <button onclick="inviteByEmail()" class="px-2.5 py-1.5 bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/40 text-indigo-300 text-xs font-medium rounded-lg flex items-center space-x-1.5 active:scale-95 transition-all" title="Send Email Invite">
+            <i class="fa-solid fa-envelope text-[10px]"></i>
+            <span class="hidden sm:inline">Email Invite</span>
+          </button>
+
+          <!-- Leave Meeting -->
+          <button onclick="leaveMeeting()" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-lg flex items-center space-x-1.5 active:scale-95 transition-all shadow-sm shadow-rose-600/30" title="Leave Call">
+            <i class="fa-solid fa-phone-slash text-xs"></i>
+            <span>Leave</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Video & Screen Share Container -->
+      <div id="meet-container" class="flex-1 w-full h-full bg-slate-950 overflow-hidden relative">
+        <!-- WebRTC frame mounts here -->
+      </div>
+    </div>
+
   </div>
 
   <!-- DNS VIEW -->
@@ -901,6 +1066,10 @@ function renderWebAppHtml(): string {
     let attachedFiles = [];
     let currentDraftId = null;
 
+    // NEXUS MEET STATE
+    let jitsiApi = null;
+    let currentMeetRoom = null;
+
     // SIDEBAR DRAWER (MOBILE)
     function toggleSidebar(open) {
       const sb = document.getElementById('app-sidebar');
@@ -1028,7 +1197,6 @@ function renderWebAppHtml(): string {
           senderText = 'Draft: ' + (m.to ? 'To ' + m.to : '(No Recipient)');
         }
         
-        // Account badge pill
         const accKey = (m.account || (m.folder === 'sent' || m.folder === 'drafts' ? m.from : m.to) || '').toLowerCase();
         let badgeText = 'info';
         let badgeClass = 'bg-indigo-50 text-indigo-700 border-indigo-200';
@@ -1234,14 +1402,144 @@ function renderWebAppHtml(): string {
     }
 
     function switchTab(t) {
-      if (t === 'dns') {
-        document.getElementById('mail-view').classList.add('hidden');
-        document.getElementById('dns-view').classList.remove('hidden');
+      const mailView = document.getElementById('mail-view');
+      const dnsView = document.getElementById('dns-view');
+      const meetView = document.getElementById('meet-view');
+      const btnMeet = document.getElementById('btn-meet');
+      const btnDns = document.getElementById('btn-dns');
+
+      mailView.classList.add('hidden');
+      dnsView.classList.add('hidden');
+      meetView.classList.add('hidden');
+
+      btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
+      btnDns.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
+
+      if (t === 'meet') {
+        meetView.classList.remove('hidden');
+        btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-rose-600/20 text-rose-300 font-semibold';
+      } else if (t === 'dns') {
+        dnsView.classList.remove('hidden');
+        btnDns.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium';
       } else {
-        document.getElementById('mail-view').classList.remove('hidden');
-        document.getElementById('dns-view').classList.add('hidden');
+        mailView.classList.remove('hidden');
       }
       toggleSidebar(false);
+    }
+
+    // NEXUS MEET VIDEO CALLING & SCREEN SHARING ENGINE
+    function startInstantMeeting() {
+      const room = 'devgeeksnexus-' + Math.random().toString(36).substring(2, 9);
+      joinRoom(room);
+    }
+
+    function handleJoinCode(e) {
+      e.preventDefault();
+      const code = document.getElementById('join-room-input').value.trim();
+      if (!code) return;
+      joinRoom(code.startsWith('devgeeksnexus-') ? code : 'devgeeksnexus-' + code);
+    }
+
+    function joinRoom(roomName) {
+      currentMeetRoom = roomName.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+      if (!currentMeetRoom) return;
+
+      switchTab('meet');
+
+      document.getElementById('meet-lobby').classList.add('hidden');
+      document.getElementById('meet-active-stage').classList.remove('hidden');
+      document.getElementById('active-room-title').textContent = currentMeetRoom;
+
+      // Mount Jitsi Meet WebRTC Call Frame
+      const container = document.getElementById('meet-container');
+      container.innerHTML = '';
+
+      if (typeof JitsiMeetExternalAPI === 'undefined') {
+        container.innerHTML = '<div class="p-8 text-center text-white"><p>Loading video conferencing engine...</p></div>';
+        return;
+      }
+
+      const domain = 'meet.jit.si';
+      const userDisplay = currentAccount !== 'all' ? currentAccount.split('@')[0] : 'DevGeeks Nexus';
+      const userEmail = currentAccount !== 'all' ? currentAccount : 'info@devgeeksnexus.com';
+
+      const options = {
+        roomName: currentMeetRoom,
+        width: '100%',
+        height: '100%',
+        parentNode: container,
+        userInfo: {
+          displayName: userDisplay,
+          email: userEmail
+        },
+        configOverwrite: {
+          startWithAudioMuted: false,
+          startWithVideoMuted: false,
+          prejoinPageEnabled: true,
+          disableDeepLinking: true
+        },
+        interfaceConfigOverwrite: {
+          SHOW_JITSI_WATERMARK: false,
+          SHOW_WATERMARK_FOR_GUESTS: false,
+          TOOLBAR_BUTTONS: [
+            'microphone', 'camera', 'desktop', 'chat', 'raisehand',
+            'tileview', 'fullscreen', 'settings', 'hangup', 'videoquality',
+            'participants-pane', 'recording'
+          ],
+        }
+      };
+
+      try {
+        jitsiApi = new JitsiMeetExternalAPI(domain, options);
+        jitsiApi.addEventListener('videoConferenceLeft', () => {
+          leaveMeeting();
+        });
+      } catch (err) {
+        console.error('Failed to init conference', err);
+        container.innerHTML = '<div class="p-8 text-center text-rose-400"><p>Unable to load meeting frame.</p></div>';
+      }
+    }
+
+    function copyMeetingLink() {
+      if (!currentMeetRoom) return;
+      const link = window.location.origin + '/?meet=' + currentMeetRoom;
+      navigator.clipboard.writeText(link).then(() => {
+        const textSpan = document.getElementById('copy-link-text');
+        if (textSpan) {
+          const original = textSpan.textContent;
+          textSpan.textContent = 'Copied!';
+          setTimeout(() => { textSpan.textContent = original; }, 2000);
+        }
+        alert('Meeting link copied to clipboard:\\n' + link);
+      });
+    }
+
+    function inviteByEmail() {
+      if (!currentMeetRoom) return;
+      const link = window.location.origin + '/?meet=' + currentMeetRoom;
+      openCompose();
+      document.getElementById('compose-subject').value = 'Invitation: DevGeeksNexus Live Video Training Session';
+      document.getElementById('compose-body').value = 
+        'Hello,\\n\\nYou are invited to join our live video training and collaboration session on Nexus Meet.\\n\\n' +
+        '🔗 Click here to join directly in your browser:\\n' + link + '\\n\\n' +
+        'Meeting Highlights:\\n' +
+        '- High-definition Screen Sharing (code, slides, presentations)\\n' +
+        '- Two-way Audio & Video Call\\n' +
+        '- Real-time In-Meeting Group Messaging\\n' +
+        '- Zero downloads required — join from phone or laptop.\\n\\n' +
+        'Looking forward to seeing you there!\\n\\n' +
+        'Best regards,\\nDevGeeksNexus Team';
+    }
+
+    function leaveMeeting() {
+      if (jitsiApi) {
+        try { jitsiApi.dispose(); } catch (e) {}
+        jitsiApi = null;
+      }
+      currentMeetRoom = null;
+      document.getElementById('meet-container').innerHTML = '';
+      document.getElementById('meet-active-stage').classList.add('hidden');
+      document.getElementById('meet-lobby').classList.remove('hidden');
     }
 
     // TOGGLE CC & BCC
@@ -1521,9 +1819,18 @@ function renderWebAppHtml(): string {
       }
     });
 
-    // Initial load & periodic refresh
-    loadMessages();
-    setInterval(loadMessages, 15000);
+    // Check URL parameters for direct meeting room link
+    const urlParams = new URLSearchParams(window.location.search);
+    const meetParam = urlParams.get('meet');
+    if (meetParam) {
+      joinRoom(meetParam);
+    } else {
+      loadMessages();
+    }
+
+    setInterval(() => {
+      if (!currentMeetRoom) loadMessages();
+    }, 15000);
   </script>
 </body>
 </html>`;
