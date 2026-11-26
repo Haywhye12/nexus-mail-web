@@ -1863,21 +1863,34 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
   <script src="https://meet.jit.si/external_api.js"></script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
-    body { font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; }
-    iframe { border: none !important; }
+    html, body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+    }
+    #meet-stage, #standalone-jitsi-container, #standalone-jitsi-container iframe {
+      width: 100% !important;
+      height: 100% !important;
+      min-height: 100% !important;
+      border: none !important;
+      display: block;
+    }
   </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
+<body class="bg-slate-950 text-slate-100 h-screen w-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white overflow-hidden">
 
   <!-- Top Navigation Header -->
-  <header class="h-16 bg-slate-900/90 backdrop-blur border-b border-slate-800/80 px-4 md:px-8 flex items-center justify-between z-20">
+  <header class="h-14 md:h-16 shrink-0 bg-slate-900/95 backdrop-blur border-b border-slate-800/80 px-4 md:px-8 flex items-center justify-between z-20">
     <div class="flex items-center gap-3">
-      <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-sky-400 flex items-center justify-center text-white shadow-lg shadow-indigo-500/25 ring-1 ring-white/20">
-        <i class="fa-solid fa-video text-base"></i>
+      <div class="w-9 h-9 md:w-10 md:h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-sky-400 flex items-center justify-center text-white shadow-lg shadow-indigo-500/25 ring-1 ring-white/20">
+        <i class="fa-solid fa-video text-sm md:text-base"></i>
       </div>
       <div>
         <div class="flex items-center gap-2">
-          <span class="font-bold text-base md:text-lg tracking-tight text-white">DevGeeksNexus</span>
+          <span class="font-bold text-sm md:text-base tracking-tight text-white">DevGeeksNexus</span>
           <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
             LIVE
@@ -1901,10 +1914,10 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
   </header>
 
   <!-- Main View Area -->
-  <main class="flex-1 flex flex-col relative overflow-hidden bg-slate-950">
+  <main class="flex-1 w-full relative overflow-hidden bg-slate-950 flex flex-col min-h-0">
 
     <!-- Pre-join Lobby Card -->
-    <div id="prejoin-lobby" class="flex-1 flex items-center justify-center p-4 md:p-6 z-10">
+    <div id="prejoin-lobby" class="absolute inset-0 flex items-center justify-center p-4 md:p-6 z-10 overflow-y-auto">
       <div class="max-w-md w-full bg-slate-900 border border-slate-800/90 rounded-2xl shadow-2xl p-6 md:p-8 relative">
         <div class="text-center mb-6">
           <div class="w-16 h-16 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 flex items-center justify-center text-2xl mx-auto mb-4">
@@ -1948,12 +1961,12 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
     </div>
 
     <!-- Active Conference Fullscreen Stage -->
-    <div id="meet-stage" class="hidden flex-1 w-full h-full relative bg-slate-950">
+    <div id="meet-stage" class="hidden absolute inset-0 w-full h-full bg-slate-950">
       <div id="standalone-jitsi-container" class="w-full h-full"></div>
     </div>
 
     <!-- Leave Call Screen -->
-    <div id="leave-screen" class="hidden flex-1 flex items-center justify-center p-4 z-10">
+    <div id="leave-screen" class="hidden absolute inset-0 flex items-center justify-center p-4 z-10">
       <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-8 text-center">
         <div class="w-16 h-16 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center text-2xl mx-auto mb-4">
           <i class="fa-solid fa-circle-check"></i>
