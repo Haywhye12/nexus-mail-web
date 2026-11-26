@@ -76,7 +76,6 @@ export default {
       const fromAddress = message.from || (parsed.from?.address) || 'unknown';
       const ccAddress = (parsed.cc || []).map((c: any) => c.address || c.name).join(', ');
 
-      // Resolve which mailbox this email was sent to
       const targetAccount = resolveAccount(toAddress);
 
       const attachments = (parsed.attachments || []).map((att: any) => ({
@@ -89,7 +88,7 @@ export default {
       const msgId = `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
       const payload = {
         id: msgId,
-        account: targetAccount, // Target mailbox (info@, ayomidebobani@, admin@)
+        account: targetAccount,
         from: fromAddress,
         fromName: parsed.from?.name || fromAddress,
         to: toAddress,
@@ -134,14 +133,14 @@ export default {
           const item = await env.EMAILS.get(key.name, 'json');
           if (item) {
             if (!item.account) {
-              item.account = resolveAccount(item.folder === 'sent' ? item.from : item.to);
+              item.account = resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to);
             }
             allFetched.push(item);
           }
         }
       }
 
-      // Compute statistics per account for badges
+      // Compute statistics per account and folder
       const stats: Record<string, { unread: number; total: number }> = {
         'all': { unread: 0, total: 0 },
       };
@@ -149,9 +148,23 @@ export default {
         stats[acc.email.toLowerCase()] = { unread: 0, total: 0 };
       });
 
+      const folderCounts = {
+        inbox: 0,
+        drafts: 0,
+        sent: 0,
+      };
+
       for (const item of allFetched) {
+        const itemAcc = (item.account || resolveAccount(item.from || item.to)).toLowerCase();
+        const matchesCurrentAcc = selectedAccount === 'all' || itemAcc === selectedAccount;
+
+        if (matchesCurrentAcc) {
+          if (item.folder === 'inbox') folderCounts.inbox++;
+          if (item.folder === 'drafts') folderCounts.drafts++;
+          if (item.folder === 'sent') folderCounts.sent++;
+        }
+
         if (item.folder === 'inbox') {
-          const itemAcc = (item.account || resolveAccount(item.to)).toLowerCase();
           if (stats[itemAcc]) {
             stats[itemAcc].total++;
             if (!item.isRead) stats[itemAcc].unread++;
@@ -165,7 +178,7 @@ export default {
       const messages = allFetched.filter((item) => {
         if (folder && item.folder !== folder) return false;
         if (selectedAccount !== 'all') {
-          const itemAcc = (item.account || resolveAccount(item.folder === 'sent' ? item.from : item.to)).toLowerCase();
+          const itemAcc = (item.account || resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to)).toLowerCase();
           const toStr = (item.to || '').toLowerCase();
           const fromStr = (item.from || '').toLowerCase();
           return itemAcc === selectedAccount || toStr.includes(selectedAccount) || fromStr.includes(selectedAccount);
@@ -179,6 +192,7 @@ export default {
         JSON.stringify({
           messages,
           stats,
+          folderCounts,
           accounts: KNOWN_ACCOUNTS,
         }),
         {
@@ -187,11 +201,73 @@ export default {
       );
     }
 
+    // API: POST /api/drafts (Save or update draft in KV)
+    if (request.method === 'POST' && url.pathname === '/api/drafts') {
+      try {
+        const body = (await request.json()) as any;
+        const { id, from, to, cc, bcc, subject, html, text, attachments } = body;
+
+        let senderEmail = 'info@devgeeksnexus.com';
+        let senderDisplayName = 'DevGeeksNexus Team';
+        const matchedAccount = KNOWN_ACCOUNTS.find(
+          (acc) => acc.email.toLowerCase() === (from || '').trim().toLowerCase()
+        );
+        if (matchedAccount) {
+          senderEmail = matchedAccount.email;
+          senderDisplayName = matchedAccount.name;
+        } else if (from && from.toLowerCase().endsWith('@devgeeksnexus.com')) {
+          senderEmail = from.trim().toLowerCase();
+          senderDisplayName = senderEmail.split('@')[0];
+        }
+
+        const draftId = id || `draft_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+        const draftDate = new Date().toISOString();
+
+        const draftMsg = {
+          id: draftId,
+          account: senderEmail,
+          from: senderEmail,
+          fromName: senderDisplayName,
+          to: to || '',
+          cc: cc || '',
+          bcc: bcc || '',
+          subject: subject || '(Draft)',
+          text: text || '',
+          html: html || '',
+          date: draftDate,
+          folder: 'drafts',
+          isRead: true,
+          isStarred: false,
+          attachments: attachments || [],
+        };
+
+        if (env.EMAILS) {
+          if (id) {
+            const list = await env.EMAILS.list({ prefix: 'msg:' });
+            const oldKey = list.keys.find((k: any) => k.name.endsWith(id));
+            if (oldKey) {
+              await env.EMAILS.delete(oldKey.name);
+            }
+          }
+          await env.EMAILS.put(`msg:${draftDate}:${draftId}`, JSON.stringify(draftMsg));
+        }
+
+        return new Response(JSON.stringify({ success: true, draft: draftMsg }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     // API: POST /api/send (Sends live via Resend REST API)
     if (request.method === 'POST' && url.pathname === '/api/send') {
       try {
         const body = (await request.json()) as any;
-        const { from, to, cc, bcc, subject, html, text, attachments } = body;
+        const { from, to, cc, bcc, subject, html, text, attachments, draftId } = body;
 
         const toList = parseEmailList(to);
         const ccList = parseEmailList(cc);
@@ -264,6 +340,15 @@ export default {
           });
         }
 
+        // If this message was sent from a saved draft, delete the draft now
+        if (env.EMAILS && draftId) {
+          const list = await env.EMAILS.list({ prefix: 'msg:' });
+          const draftKey = list.keys.find((k: any) => k.name.endsWith(draftId));
+          if (draftKey) {
+            await env.EMAILS.delete(draftKey.name);
+          }
+        }
+
         // Store copy in Sent folder in KV
         const sentId = `sent_${Date.now()}`;
         const sentMsg = {
@@ -334,7 +419,7 @@ export default {
       }
     }
 
-    // Default: Serve the complete Nexus Mail Web Application (Mobile-Responsive)
+    // Default: Serve the complete Nexus Mail Web Application (Mobile-Responsive + Drafts)
     return new Response(renderWebAppHtml(), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
@@ -365,7 +450,7 @@ function renderWebAppHtml(): string {
 </head>
 <body class="bg-slate-50 text-slate-800 h-screen h-screen-ios flex flex-col md:flex-row overflow-hidden select-none">
 
-  <!-- MOBILE TOPBAR (Visible only on mobile screens < md) -->
+  <!-- MOBILE TOPBAR -->
   <header class="md:hidden h-14 bg-slate-900 text-white flex items-center justify-between px-3.5 border-b border-slate-800 flex-shrink-0 z-30 shadow-sm">
     <div class="flex items-center space-x-2.5">
       <button onclick="toggleSidebar(true)" class="p-2 -ml-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 active:scale-90 transition-all" aria-label="Open Mailboxes">
@@ -390,10 +475,10 @@ function renderWebAppHtml(): string {
     </div>
   </header>
 
-  <!-- SIDEBAR BACKDROP OVERLAY (Mobile only) -->
+  <!-- SIDEBAR BACKDROP OVERLAY -->
   <div id="sidebar-backdrop" onclick="toggleSidebar(false)" class="hidden fixed inset-0 bg-slate-950/70 backdrop-blur-xs z-40 md:hidden transition-opacity"></div>
 
-  <!-- SIDEBAR (Off-canvas drawer on mobile, static on desktop) -->
+  <!-- SIDEBAR -->
   <aside id="app-sidebar" class="fixed inset-y-0 left-0 z-50 w-72 bg-slate-900 text-slate-200 flex flex-col border-r border-slate-800 select-none transform -translate-x-full md:relative md:translate-x-0 transition-transform duration-300 ease-in-out shadow-2xl md:shadow-none flex-shrink-0">
     <!-- Brand Header -->
     <div class="p-4 border-b border-slate-800 flex items-center justify-between">
@@ -406,7 +491,6 @@ function renderWebAppHtml(): string {
       </div>
       <div class="flex items-center space-x-2">
         <span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-950 text-emerald-400 border border-emerald-800">Live</span>
-        <!-- Close Drawer Button (Mobile only) -->
         <button onclick="toggleSidebar(false)" class="md:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800" aria-label="Close Menu">
           <i class="fa-solid fa-xmark text-lg"></i>
         </button>
@@ -489,6 +573,7 @@ function renderWebAppHtml(): string {
 
     <!-- Navigation -->
     <nav class="flex-1 px-3 space-y-1 overflow-y-auto custom-scroll">
+      <!-- Inbox -->
       <button onclick="switchFolder('inbox')" id="btn-inbox" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium">
         <div class="flex items-center space-x-3">
           <i class="fa-solid fa-inbox w-4"></i>
@@ -497,11 +582,25 @@ function renderWebAppHtml(): string {
         <span id="unread-count" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
       </button>
 
-      <button onclick="switchFolder('sent')" id="btn-sent" class="w-full flex items-center space-x-3 px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
-        <i class="fa-solid fa-paper-plane w-4"></i>
-        <span>Sent Messages</span>
+      <!-- Drafts -->
+      <button onclick="switchFolder('drafts')" id="btn-drafts" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid fa-file-pen w-4 text-amber-400"></i>
+          <span>Drafts</span>
+        </div>
+        <span id="drafts-count" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
       </button>
 
+      <!-- Sent -->
+      <button onclick="switchFolder('sent')" id="btn-sent" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid fa-paper-plane w-4 text-slate-400"></i>
+          <span>Sent Messages</span>
+        </div>
+        <span id="sent-count" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
+      </button>
+
+      <!-- DNS -->
       <button onclick="switchTab('dns')" id="btn-dns" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
         <div class="flex items-center space-x-3">
           <i class="fa-solid fa-shield-halved w-4 text-emerald-400"></i>
@@ -524,9 +623,8 @@ function renderWebAppHtml(): string {
   <!-- MAIN APP CONTAINER -->
   <div id="mail-view" class="flex-1 flex flex-col md:flex-row overflow-hidden relative">
     
-    <!-- Email List Section (Full width on mobile, w-96 on desktop) -->
+    <!-- Email List Section -->
     <section id="email-list-section" class="w-full md:w-96 border-r border-slate-200 bg-white flex flex-col h-full flex-shrink-0">
-      <!-- Search & Refresh Bar -->
       <div class="p-2.5 sm:p-3 border-b border-slate-200 flex items-center space-x-2 bg-white">
         <div class="relative flex-1">
           <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
@@ -553,15 +651,14 @@ function renderWebAppHtml(): string {
       </div>
     </section>
 
-    <!-- Reading Pane (Hidden on mobile until email selected, full width on mobile) -->
+    <!-- Reading Pane -->
     <main id="reading-pane" class="hidden md:flex flex-1 bg-white flex-col overflow-hidden h-full">
-      <!-- Empty State (Desktop only) -->
       <div id="empty-state" class="flex-1 flex flex-col items-center justify-center text-slate-400 p-8">
         <div class="w-16 h-16 rounded-full bg-slate-100 flex items-center justify-center mb-3">
           <i class="fa-regular fa-envelope text-3xl text-slate-400"></i>
         </div>
         <p class="text-sm font-semibold text-slate-700">Select an email to read</p>
-        <p class="text-xs text-slate-400 mt-1">Multi-account routing active for devgeeksnexus.com.</p>
+        <p class="text-xs text-slate-400 mt-1">Multi-account routing & drafts active.</p>
       </div>
 
       <!-- Email Detail Container -->
@@ -569,16 +666,21 @@ function renderWebAppHtml(): string {
         <!-- Action Header -->
         <div class="p-2.5 sm:p-4 border-b border-slate-200 flex items-center justify-between bg-slate-50 flex-shrink-0">
           <div class="flex items-center space-x-1.5 sm:space-x-2">
-            <!-- Back to List Button (Mobile only) -->
             <button onclick="backToList()" class="md:hidden flex items-center space-x-1 px-2.5 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 shadow-xs active:scale-95 transition-all mr-1">
               <i class="fa-solid fa-arrow-left text-xs text-indigo-600"></i>
               <span>Back</span>
             </button>
 
+            <!-- Edit Draft Button (shown when viewing draft) -->
+            <button id="btn-detail-edit-draft" onclick="editSelectedDraft()" class="hidden px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow-sm active:scale-95 transition-all">
+              <i class="fa-solid fa-pen-to-square text-xs"></i>
+              <span>Resume Draft</span>
+            </button>
+
             <button onclick="deleteCurrentMessage()" class="p-1.5 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors" title="Delete">
               <i class="fa-solid fa-trash-can text-sm"></i>
             </button>
-            <button onclick="replyToCurrentMessage()" class="px-2.5 py-1.5 bg-white hover:bg-indigo-50 border border-slate-200 rounded-lg text-xs font-medium text-indigo-600 flex items-center space-x-1.5 active:scale-95 transition-all" title="Reply">
+            <button id="btn-detail-reply" onclick="replyToCurrentMessage()" class="px-2.5 py-1.5 bg-white hover:bg-indigo-50 border border-slate-200 rounded-lg text-xs font-medium text-indigo-600 flex items-center space-x-1.5 active:scale-95 transition-all" title="Reply">
               <i class="fa-solid fa-reply text-xs"></i>
               <span>Reply</span>
             </button>
@@ -620,7 +722,7 @@ function renderWebAppHtml(): string {
       </div>
     </main>
 
-    <!-- MOBILE FLOATING ACTION BUTTON (Compose FAB) -->
+    <!-- MOBILE FAB -->
     <button onclick="openCompose()" class="md:hidden fixed bottom-5 right-5 w-13 h-13 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl shadow-indigo-600/40 flex items-center justify-center text-lg z-30 active:scale-90 transition-all" aria-label="Compose New Email">
       <i class="fa-solid fa-plus text-xl"></i>
     </button>
@@ -666,7 +768,7 @@ function renderWebAppHtml(): string {
     </div>
   </div>
 
-  <!-- COMPOSE MODAL (Responsive Bottom-Sheet on Mobile, Centered Modal on Desktop) -->
+  <!-- COMPOSE MODAL (WITH DRAFT SAVING SUPPORT) -->
   <div id="compose-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4 z-50 transition-all">
     <div class="bg-white rounded-t-2xl sm:rounded-xl shadow-2xl border border-slate-200 w-full sm:max-w-2xl max-h-[92vh] sm:max-h-[85vh] h-[88vh] sm:h-auto overflow-hidden flex flex-col animate-in slide-in-from-bottom sm:slide-in-from-bottom-0 sm:fade-in sm:zoom-in-95 duration-200">
       
@@ -674,11 +776,14 @@ function renderWebAppHtml(): string {
       <div class="px-4 py-3 bg-slate-900 text-white flex items-center justify-between flex-shrink-0">
         <span class="text-xs sm:text-sm font-semibold flex items-center space-x-2">
           <i class="fa-solid fa-paper-plane text-indigo-400"></i>
-          <span>New Email Message</span>
+          <span id="compose-modal-title">New Email Message</span>
         </span>
-        <button onclick="closeCompose()" class="p-1 text-slate-400 hover:text-white rounded-md active:scale-95" aria-label="Close">
-          <i class="fa-solid fa-xmark text-base"></i>
-        </button>
+        <div class="flex items-center space-x-2">
+          <span id="draft-status-pill" class="hidden px-2 py-0.5 rounded text-[10px] bg-slate-800 text-amber-300 font-mono">Draft</span>
+          <button onclick="closeCompose()" class="p-1 text-slate-400 hover:text-white rounded-md active:scale-95" aria-label="Close">
+            <i class="fa-solid fa-xmark text-base"></i>
+          </button>
+        </div>
       </div>
 
       <form onsubmit="handleSend(event)" class="flex-1 flex flex-col overflow-hidden">
@@ -731,7 +836,7 @@ function renderWebAppHtml(): string {
           <!-- Subject -->
           <div class="flex items-center space-x-2 sm:space-x-3 text-xs">
             <label class="w-12 sm:w-14 font-semibold text-slate-500 text-right flex-shrink-0">Subject:</label>
-            <input type="text" id="compose-subject" required placeholder="Subject of your message..." class="flex-1 px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+            <input type="text" id="compose-subject" placeholder="Subject of your message..." class="flex-1 px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
           </div>
 
           <!-- Formatting & Attachment Toolbar -->
@@ -753,7 +858,7 @@ function renderWebAppHtml(): string {
 
           <!-- Body -->
           <div>
-            <textarea id="compose-body" rows="6" required placeholder="Write your message here... (HTML formatting supported)" class="w-full p-3 border border-slate-200 rounded-lg text-xs sm:text-sm focus:ring-2 focus:ring-indigo-500 text-slate-800 font-sans leading-relaxed"></textarea>
+            <textarea id="compose-body" rows="6" placeholder="Write your message here..." class="w-full p-3 border border-slate-200 rounded-lg text-xs sm:text-sm focus:ring-2 focus:ring-indigo-500 text-slate-800 font-sans leading-relaxed"></textarea>
           </div>
 
           <!-- Attachment Tray -->
@@ -766,12 +871,19 @@ function renderWebAppHtml(): string {
           </div>
         </div>
 
-        <!-- Modal Footer Actions -->
+        <!-- Modal Footer Actions (Save Draft + Send) -->
         <div class="p-3 sm:p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between flex-shrink-0">
-          <span class="text-[10px] sm:text-[11px] text-slate-400 truncate max-w-[150px] sm:max-w-none">SPF & DKIM signed for all senders.</span>
-          <div class="flex space-x-2">
-            <button type="button" onclick="closeCompose()" class="px-3.5 py-2 text-xs font-medium text-slate-600 hover:bg-slate-200 rounded-lg active:scale-95 transition-all">Cancel</button>
-            <button type="submit" id="btn-submit" class="flex items-center space-x-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg shadow-sm active:scale-95 transition-all">
+          <div class="flex items-center space-x-2">
+            <button type="button" onclick="handleSaveDraft()" id="btn-save-draft" class="flex items-center space-x-1.5 px-3 py-2 bg-white hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 shadow-xs active:scale-95 transition-all">
+              <i class="fa-solid fa-floppy-disk text-slate-400"></i>
+              <span id="btn-save-draft-text">Save Draft</span>
+            </button>
+            <span id="draft-saved-notice" class="hidden text-[11px] text-emerald-600 font-medium">✓ Saved</span>
+          </div>
+
+          <div class="flex items-center space-x-2">
+            <button type="button" onclick="closeCompose()" class="px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-200 rounded-lg active:scale-95 transition-all">Discard</button>
+            <button type="submit" id="btn-submit" class="flex items-center space-x-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-sm active:scale-95 transition-all">
               <i class="fa-solid fa-paper-plane text-xs"></i>
               <span id="btn-submit-text">Send Email</span>
             </button>
@@ -787,6 +899,7 @@ function renderWebAppHtml(): string {
     let currentAccount = 'all'; // 'all' | 'info@devgeeksnexus.com' | 'ayomidebobani@devgeeksnexus.com' | 'admin@devgeeksnexus.com'
     let selectedMsg = null;
     let attachedFiles = [];
+    let currentDraftId = null;
 
     // SIDEBAR DRAWER (MOBILE)
     function toggleSidebar(open) {
@@ -821,7 +934,7 @@ function renderWebAppHtml(): string {
         const res = await fetch(url);
         const data = await res.json();
         allMessages = data.messages || [];
-        updateAccountStats(data.stats);
+        updateAccountStats(data.stats, data.folderCounts);
         renderList();
       } catch (e) {
         console.error('Failed to load messages', e);
@@ -831,7 +944,7 @@ function renderWebAppHtml(): string {
       }
     }
 
-    function updateAccountStats(stats) {
+    function updateAccountStats(stats, folderCounts) {
       if (!stats) return;
       const allUnread = stats['all'] ? stats['all'].unread : 0;
       const infoUnread = stats['info@devgeeksnexus.com'] ? stats['info@devgeeksnexus.com'].unread : 0;
@@ -847,6 +960,12 @@ function renderWebAppHtml(): string {
         document.getElementById('unread-count').textContent = allUnread;
       } else if (stats[currentAccount.toLowerCase()]) {
         document.getElementById('unread-count').textContent = stats[currentAccount.toLowerCase()].unread;
+      }
+
+      // Update folder counts
+      if (folderCounts) {
+        document.getElementById('drafts-count').textContent = folderCounts.drafts || 0;
+        document.getElementById('sent-count').textContent = folderCounts.sent || 0;
       }
     }
 
@@ -894,17 +1013,23 @@ function renderWebAppHtml(): string {
       document.getElementById('list-count-badge').textContent = filtered.length + ' msgs';
 
       if (filtered.length === 0) {
-        listEl.innerHTML = '<div class="p-8 text-center text-slate-400 text-sm"><i class="fa-regular fa-envelope text-3xl mb-2 opacity-30 block"></i>No messages found in this mailbox</div>';
+        listEl.innerHTML = '<div class="p-8 text-center text-slate-400 text-sm"><i class="fa-regular fa-envelope text-3xl mb-2 opacity-30 block"></i>No messages found in ' + currentFolder + '</div>';
         return;
       }
 
       listEl.innerHTML = filtered.map(m => {
         const isSelected = selectedMsg && selectedMsg.id === m.id;
         const dateStr = new Date(m.date).toLocaleDateString([], { month: 'short', day: 'numeric' });
-        const sender = currentFolder === 'sent' ? 'To: ' + m.to : (m.fromName || m.from);
+        
+        let senderText = m.fromName || m.from;
+        if (currentFolder === 'sent') {
+          senderText = 'To: ' + (m.to || '(No Recipient)');
+        } else if (currentFolder === 'drafts') {
+          senderText = 'Draft: ' + (m.to ? 'To ' + m.to : '(No Recipient)');
+        }
         
         // Account badge pill
-        const accKey = (m.account || (m.folder === 'sent' ? m.from : m.to) || '').toLowerCase();
+        const accKey = (m.account || (m.folder === 'sent' || m.folder === 'drafts' ? m.from : m.to) || '').toLowerCase();
         let badgeText = 'info';
         let badgeClass = 'bg-indigo-50 text-indigo-700 border-indigo-200';
 
@@ -916,6 +1041,8 @@ function renderWebAppHtml(): string {
           badgeClass = 'bg-amber-50 text-amber-700 border-amber-200';
         }
 
+        const isDraft = currentFolder === 'drafts' || m.folder === 'drafts';
+
         return \`
           <div onclick="selectMessage('\${m.id}')" class="p-3 sm:p-3.5 cursor-pointer transition-colors border-l-4 \${
             isSelected ? 'bg-indigo-50/70 border-l-indigo-600' :
@@ -923,16 +1050,19 @@ function renderWebAppHtml(): string {
             'bg-indigo-50/30 hover:bg-indigo-50/50 border-l-indigo-500 font-semibold'
           }">
             <div class="flex items-center justify-between mb-1">
-              <span class="text-xs font-semibold text-slate-900 truncate max-w-[200px] sm:max-w-[190px]">\${escapeHtml(sender)}</span>
+              <span class="text-xs font-semibold text-slate-900 truncate max-w-[200px] sm:max-w-[190px] \${isDraft ? 'text-amber-800' : ''}">\${escapeHtml(senderText)}</span>
               <span class="text-[10px] text-slate-400">\${dateStr}</span>
             </div>
-            <div class="text-xs font-medium text-slate-800 truncate mb-1">\${escapeHtml(m.subject || '(No Subject)')}</div>
+            <div class="text-xs font-medium text-slate-800 truncate mb-1">\${escapeHtml(m.subject || (isDraft ? '(Draft - No Subject)' : '(No Subject)'))}</div>
             <div class="text-xs text-slate-500 line-clamp-2 mb-2">\${escapeHtml(m.text || '')}</div>
             <div class="flex items-center justify-between pt-1 text-[10px]">
-              <span class="px-1.5 py-0.5 rounded border text-[9px] font-mono font-medium uppercase \${badgeClass}">\${badgeText}</span>
+              <div class="flex items-center space-x-1.5">
+                <span class="px-1.5 py-0.5 rounded border text-[9px] font-mono font-medium uppercase \${badgeClass}">\${badgeText}</span>
+                \${isDraft ? '<span class="px-1.5 py-0.5 rounded border text-[9px] font-semibold bg-amber-100 text-amber-800 border-amber-300">DRAFT</span>' : ''}
+              </div>
               <div class="flex items-center space-x-2 text-slate-400">
                 \${(m.attachments && m.attachments.length > 0) ? '<span><i class="fa-solid fa-paperclip mr-1"></i>' + m.attachments.length + '</span>' : ''}
-                \${!m.isRead ? '<span class="w-2 h-2 rounded-full bg-indigo-600 inline-block"></span>' : ''}
+                \${!m.isRead && !isDraft ? '<span class="w-2 h-2 rounded-full bg-indigo-600 inline-block"></span>' : ''}
               </div>
             </div>
           </div>
@@ -944,7 +1074,7 @@ function renderWebAppHtml(): string {
       selectedMsg = allMessages.find(m => m.id === id);
       if (!selectedMsg) return;
 
-      if (!selectedMsg.isRead) {
+      if (!selectedMsg.isRead && selectedMsg.folder !== 'drafts') {
         selectedMsg.isRead = true;
         fetch('/api/messages', {
           method: 'PATCH',
@@ -955,7 +1085,6 @@ function renderWebAppHtml(): string {
 
       renderList();
 
-      // Mobile Responsive Switch: Hide list section, reveal reading pane
       const listSec = document.getElementById('email-list-section');
       const readingPane = document.getElementById('reading-pane');
       if (window.innerWidth < 768) {
@@ -966,14 +1095,27 @@ function renderWebAppHtml(): string {
       document.getElementById('empty-state').classList.add('hidden');
       document.getElementById('message-detail').classList.remove('hidden');
 
-      document.getElementById('detail-subject').textContent = selectedMsg.subject;
+      document.getElementById('detail-subject').textContent = selectedMsg.subject || '(Draft)';
       document.getElementById('detail-id').textContent = selectedMsg.id;
       document.getElementById('detail-from-name').textContent = selectedMsg.fromName || selectedMsg.from;
       document.getElementById('detail-from').textContent = selectedMsg.from;
-      document.getElementById('detail-to').textContent = selectedMsg.to;
+      document.getElementById('detail-to').textContent = selectedMsg.to || '(No Recipient)';
+
+      // Action buttons adaptation for Drafts
+      const isDraft = selectedMsg.folder === 'drafts';
+      const editDraftBtn = document.getElementById('btn-detail-edit-draft');
+      const replyBtn = document.getElementById('btn-detail-reply');
+
+      if (isDraft) {
+        editDraftBtn.classList.remove('hidden');
+        replyBtn.classList.add('hidden');
+      } else {
+        editDraftBtn.classList.add('hidden');
+        replyBtn.classList.remove('hidden');
+      }
 
       // Mailbox Badge
-      const accKey = (selectedMsg.account || (selectedMsg.folder === 'sent' ? selectedMsg.from : selectedMsg.to) || '').toLowerCase();
+      const accKey = (selectedMsg.account || (selectedMsg.folder === 'sent' || selectedMsg.folder === 'drafts' ? selectedMsg.from : selectedMsg.to) || '').toLowerCase();
       const badgeEl = document.getElementById('detail-account-badge');
       if (accKey.includes('ayomidebobani')) {
         badgeEl.textContent = 'ayomidebobani@devgeeksnexus.com';
@@ -1004,8 +1146,8 @@ function renderWebAppHtml(): string {
       }
 
       document.getElementById('detail-date').textContent = new Date(selectedMsg.date).toLocaleString();
-      document.getElementById('detail-avatar').textContent = (selectedMsg.fromName || selectedMsg.from).charAt(0).toUpperCase();
-      document.getElementById('detail-body').innerHTML = selectedMsg.html || escapeHtml(selectedMsg.text);
+      document.getElementById('detail-avatar').textContent = (selectedMsg.fromName || selectedMsg.from || 'D').charAt(0).toUpperCase();
+      document.getElementById('detail-body').innerHTML = selectedMsg.html || escapeHtml(selectedMsg.text) || '<p class="text-slate-400 italic">(Empty message body)</p>';
 
       const attSection = document.getElementById('detail-attachments');
       const attGrid = document.getElementById('attachments-grid');
@@ -1033,6 +1175,11 @@ function renderWebAppHtml(): string {
       } else {
         attSection.classList.add('hidden');
       }
+    }
+
+    function editSelectedDraft() {
+      if (!selectedMsg) return;
+      openCompose(selectedMsg);
     }
 
     function replyToCurrentMessage() {
@@ -1063,14 +1210,23 @@ function renderWebAppHtml(): string {
       document.getElementById('message-detail').classList.add('hidden');
       document.getElementById('empty-state').classList.remove('hidden');
       backToList();
-      renderList();
+      loadMessages();
     }
 
     function switchFolder(f) {
       currentFolder = f;
       document.getElementById('folder-title').textContent = f.toUpperCase();
-      document.getElementById('btn-inbox').className = f === 'inbox' ? 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium' : 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800';
-      document.getElementById('btn-sent').className = f === 'sent' ? 'w-full flex items-center space-x-3 px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium' : 'w-full flex items-center space-x-3 px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800';
+      
+      const folders = ['inbox', 'drafts', 'sent'];
+      folders.forEach(fold => {
+        const btn = document.getElementById('btn-' + fold);
+        if (fold === f) {
+          btn.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium';
+        } else {
+          btn.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
+        }
+      });
+
       switchTab('mail');
       toggleSidebar(false);
       backToList();
@@ -1104,16 +1260,124 @@ function renderWebAppHtml(): string {
       }
     }
 
-    // COMPOSE & ATTACHMENTS
-    function openCompose() {
-      if (currentAccount !== 'all') {
-        document.getElementById('compose-from').value = currentAccount;
+    // COMPOSE & DRAFTS
+    function openCompose(draft) {
+      const modal = document.getElementById('compose-modal');
+      const modalTitle = document.getElementById('compose-modal-title');
+      const draftPill = document.getElementById('draft-status-pill');
+
+      if (draft) {
+        currentDraftId = draft.id;
+        modalTitle.textContent = 'Edit Draft';
+        draftPill.classList.remove('hidden');
+
+        document.getElementById('compose-from').value = draft.from || draft.account || 'info@devgeeksnexus.com';
+        document.getElementById('compose-to').value = draft.to || '';
+        document.getElementById('compose-subject').value = draft.subject === '(Draft)' ? '' : (draft.subject || '');
+        document.getElementById('compose-body').value = draft.text || '';
+
+        if (draft.cc) {
+          document.getElementById('field-cc').classList.remove('hidden');
+          document.getElementById('compose-cc').value = draft.cc;
+        } else {
+          hideField('cc');
+        }
+
+        if (draft.bcc) {
+          document.getElementById('field-bcc').classList.remove('hidden');
+          document.getElementById('compose-bcc').value = draft.bcc;
+        } else {
+          hideField('bcc');
+        }
+
+        attachedFiles = draft.attachments ? [...draft.attachments] : [];
+        renderAttachmentTray();
+      } else {
+        currentDraftId = null;
+        modalTitle.textContent = 'New Email Message';
+        draftPill.classList.add('hidden');
+
+        if (currentAccount !== 'all') {
+          document.getElementById('compose-from').value = currentAccount;
+        } else {
+          document.getElementById('compose-from').value = 'info@devgeeksnexus.com';
+        }
+        document.getElementById('compose-to').value = '';
+        document.getElementById('compose-subject').value = '';
+        document.getElementById('compose-body').value = '';
+        hideField('cc');
+        hideField('bcc');
+        clearAttachments();
       }
-      document.getElementById('compose-modal').classList.remove('hidden');
+
+      document.getElementById('send-alert').classList.add('hidden');
+      document.getElementById('draft-saved-notice').classList.add('hidden');
+      modal.classList.remove('hidden');
     }
+
     function closeCompose() {
       document.getElementById('compose-modal').classList.add('hidden');
       document.getElementById('send-alert').classList.add('hidden');
+      document.getElementById('draft-saved-notice').classList.add('hidden');
+      currentDraftId = null;
+    }
+
+    async function handleSaveDraft() {
+      const btn = document.getElementById('btn-save-draft');
+      const btnText = document.getElementById('btn-save-draft-text');
+      const notice = document.getElementById('draft-saved-notice');
+      
+      const from = document.getElementById('compose-from').value;
+      const to = document.getElementById('compose-to').value;
+      const cc = document.getElementById('compose-cc').value;
+      const bcc = document.getElementById('compose-bcc').value;
+      const subject = document.getElementById('compose-subject').value;
+      const body = document.getElementById('compose-body').value;
+
+      if (!to && !subject && !body) {
+        alert('Cannot save an empty draft. Please add a recipient, subject, or message body.');
+        return;
+      }
+
+      btn.disabled = true;
+      btnText.textContent = 'Saving...';
+
+      try {
+        const res = await fetch('/api/drafts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: currentDraftId,
+            from,
+            to,
+            cc,
+            bcc,
+            subject: subject || '(Draft)',
+            text: body,
+            html: body ? '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + body.replace(/\\n/g, '<br/>') + '</div>' : '',
+            attachments: attachedFiles,
+          })
+        });
+
+        const data = await res.json();
+        if (data.success && data.draft) {
+          currentDraftId = data.draft.id;
+          document.getElementById('draft-status-pill').classList.remove('hidden');
+          notice.classList.remove('hidden');
+          notice.textContent = '✓ Draft saved (' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ')';
+          setTimeout(() => {
+            notice.classList.add('hidden');
+          }, 4000);
+          loadMessages();
+        } else {
+          alert('Failed to save draft: ' + (data.error || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Network error saving draft');
+      } finally {
+        btn.disabled = false;
+        btnText.textContent = 'Save Draft';
+      }
     }
 
     function formatText(tag) {
@@ -1198,6 +1462,7 @@ function renderWebAppHtml(): string {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            draftId: currentDraftId,
             from,
             to,
             cc,
@@ -1214,16 +1479,8 @@ function renderWebAppHtml(): string {
           document.getElementById('send-alert').classList.remove('hidden');
           setTimeout(() => {
             closeCompose();
-            document.getElementById('compose-to').value = '';
-            document.getElementById('compose-cc').value = '';
-            document.getElementById('compose-bcc').value = '';
-            document.getElementById('compose-subject').value = '';
-            document.getElementById('compose-body').value = '';
-            hideField('cc');
-            hideField('bcc');
-            clearAttachments();
             loadMessages();
-          }, 1500);
+          }, 1200);
         } else {
           alert('Error: ' + (data.error || 'Failed to send'));
         }
