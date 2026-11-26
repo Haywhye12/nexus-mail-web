@@ -273,19 +273,19 @@ export default {
         // OTP is valid! Delete used OTP
         await env.EMAILS.delete(`otp:${email}`);
 
-        // Generate 30-day session token
+        // Generate 24-hour session token
         const newSessionToken = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
         const sessionPayload = {
           email,
           createdAt: Date.now(),
         };
 
-        // 30 days = 2592000 seconds
+        // 24 hours = 86400 seconds
         await env.EMAILS.put(`session:${newSessionToken}`, JSON.stringify(sessionPayload), {
-          expirationTtl: 2592000,
+          expirationTtl: 86400,
         });
 
-        const setCookieHeader = `nexus_session=${newSessionToken}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax; Secure`;
+        const setCookieHeader = `nexus_session=${newSessionToken}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure`;
 
         return new Response(JSON.stringify({ success: true, email }), {
           headers: {
