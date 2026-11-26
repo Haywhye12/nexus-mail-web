@@ -878,6 +878,13 @@ function renderWebAppHtml(): string {
         </div>
 
         <div class="flex items-center space-x-1.5 sm:space-x-2">
+          <!-- Record Meeting Button -->
+          <button id="btn-toggle-record-admin" onclick="toggleMeetingRecording('admin')" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-rose-400 hover:text-rose-300 text-xs font-medium rounded-lg flex items-center space-x-1.5 active:scale-95 transition-all shadow-sm" title="Record meeting and save to your computer">
+            <span id="record-dot-admin" class="w-2 h-2 rounded-full bg-rose-500"></span>
+            <span id="record-text-admin">Record</span>
+            <span id="record-timer-admin" class="hidden font-mono text-[11px] text-white bg-rose-600/30 px-1 rounded">00:00</span>
+          </button>
+
           <!-- Copy Invite Link -->
           <button onclick="copyMeetingLink()" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium rounded-lg flex items-center space-x-1.5 active:scale-95 transition-all" title="Copy Invite Link">
             <i class="fa-solid fa-link text-[10px]"></i>
@@ -1545,6 +1552,11 @@ function renderWebAppHtml(): string {
     }
 
     function leaveMeeting() {
+      if (recorderMediaRecorder && recorderMediaRecorder.state !== 'inactive') {
+        if (confirm('Recording is in progress. Do you want to stop recording and download your video before leaving?')) {
+          stopMeetingRecording('admin');
+        }
+      }
       if (jitsiApi) {
         try { jitsiApi.dispose(); } catch (e) {}
         jitsiApi = null;
@@ -1553,6 +1565,200 @@ function renderWebAppHtml(): string {
       document.getElementById('meet-container').innerHTML = '';
       document.getElementById('meet-active-stage').classList.add('hidden');
       document.getElementById('meet-lobby').classList.remove('hidden');
+    }
+
+    // In-browser Meeting Recorder Engine (WebM/MP4 format ready for YouTube)
+    let recorderMediaRecorder = null;
+    let recorderRecordedChunks = [];
+    let recorderTimerInterval = null;
+    let recorderSeconds = 0;
+
+    async function toggleMeetingRecording(scope) {
+      if (recorderMediaRecorder && recorderMediaRecorder.state === 'recording') {
+        stopMeetingRecording(scope);
+      } else {
+        await startMeetingRecording(scope);
+      }
+    }
+
+    async function startMeetingRecording(scope) {
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+          alert('Screen recording is not supported in this browser. Please use Chrome, Edge, or Firefox on desktop.');
+          return;
+        }
+
+        // 1. Capture system screen/tab video & meeting audio
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'browser',
+            frameRate: { ideal: 30, max: 60 },
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: 44100
+          }
+        });
+
+        // 2. Capture local host/speaker microphone audio to mix with system audio
+        let micStream = null;
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true
+            }
+          });
+        } catch (micErr) {
+          console.warn('Microphone stream access skipped or not available', micErr);
+        }
+
+        // Combine display audio and mic audio via AudioContext
+        const audioTracks = [];
+        const displayAudioTracks = displayStream.getAudioTracks();
+        const micAudioTracks = micStream ? micStream.getAudioTracks() : [];
+
+        let mixedStream = displayStream;
+
+        if (displayAudioTracks.length > 0 && micAudioTracks.length > 0) {
+          try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const dest = audioCtx.createMediaStreamDestination();
+
+            const sysSource = audioCtx.createMediaStreamSource(new MediaStream([displayAudioTracks[0]]));
+            sysSource.connect(dest);
+
+            const micSource = audioCtx.createMediaStreamSource(new MediaStream([micAudioTracks[0]]));
+            micSource.connect(dest);
+
+            const combinedAudioTrack = dest.stream.getAudioTracks()[0];
+            mixedStream = new MediaStream([
+              displayStream.getVideoTracks()[0],
+              combinedAudioTrack
+            ]);
+          } catch (mixErr) {
+            console.warn('Audio mixing fallback to display tracks', mixErr);
+            mixedStream = displayStream;
+          }
+        } else if (micAudioTracks.length > 0 && displayAudioTracks.length === 0) {
+          mixedStream = new MediaStream([
+            displayStream.getVideoTracks()[0],
+            micAudioTracks[0]
+          ]);
+        }
+
+        // Choose supported codec
+        let mimeType = 'video/webm;codecs=vp9,opus';
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'video/webm;codecs=vp8,opus';
+        }
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'video/webm';
+        }
+
+        recorderRecordedChunks = [];
+        recorderMediaRecorder = new MediaRecorder(mixedStream, {
+          mimeType,
+          videoBitsPerSecond: 2500000 // 2.5 Mbps crisp HD suitable for YouTube
+        });
+
+        recorderMediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            recorderRecordedChunks.push(e.data);
+          }
+        };
+
+        recorderMediaRecorder.onstop = () => {
+          saveRecordingToDevice(scope);
+          displayStream.getTracks().forEach(t => t.stop());
+          if (micStream) micStream.getTracks().forEach(t => t.stop());
+        };
+
+        // If user clicks browser's native "Stop sharing" button
+        displayStream.getVideoTracks()[0].onended = () => {
+          if (recorderMediaRecorder && recorderMediaRecorder.state !== 'inactive') {
+            stopMeetingRecording(scope);
+          }
+        };
+
+        recorderMediaRecorder.start(1000); // 1-sec chunks
+        updateRecordingUI(scope, true);
+
+        // Timer
+        recorderSeconds = 0;
+        clearInterval(recorderTimerInterval);
+        recorderTimerInterval = setInterval(() => {
+          recorderSeconds++;
+          const mins = String(Math.floor(recorderSeconds / 60)).padStart(2, '0');
+          const secs = String(recorderSeconds % 60).padStart(2, '0');
+          const timerEl = document.getElementById('record-timer-' + scope);
+          if (timerEl) timerEl.textContent = mins + ':' + secs;
+        }, 1000);
+
+      } catch (err) {
+        console.error('Recording initialization error:', err);
+        if (err.name !== 'NotAllowedError') {
+          alert('Could not start screen recording: ' + err.message);
+        }
+        updateRecordingUI(scope, false);
+      }
+    }
+
+    function stopMeetingRecording(scope) {
+      if (recorderMediaRecorder && recorderMediaRecorder.state !== 'inactive') {
+        recorderMediaRecorder.stop();
+      }
+      clearInterval(recorderTimerInterval);
+      updateRecordingUI(scope, false);
+    }
+
+    function updateRecordingUI(scope, isRecording) {
+      const btn = document.getElementById('btn-toggle-record-' + scope);
+      const dot = document.getElementById('record-dot-' + scope);
+      const text = document.getElementById('record-text-' + scope);
+      const timer = document.getElementById('record-timer-' + scope);
+
+      if (!btn) return;
+
+      if (isRecording) {
+        btn.classList.add('bg-rose-950/80', 'border-rose-500', 'text-rose-300');
+        btn.classList.remove('bg-slate-800', 'border-slate-700');
+        if (dot) dot.classList.add('animate-ping');
+        if (text) text.textContent = 'Stop Rec';
+        if (timer) {
+          timer.classList.remove('hidden');
+          timer.textContent = '00:00';
+        }
+      } else {
+        btn.classList.remove('bg-rose-950/80', 'border-rose-500', 'text-rose-300');
+        btn.classList.add('bg-slate-800', 'border-slate-700');
+        if (dot) dot.classList.remove('animate-ping');
+        if (text) text.textContent = 'Record';
+        if (timer) timer.classList.add('hidden');
+      }
+    }
+
+    function saveRecordingToDevice(scope) {
+      if (recorderRecordedChunks.length === 0) return;
+      const blob = new Blob(recorderRecordedChunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const dateStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const filename = 'devgeeksnexus-training-' + (currentMeetRoom || 'session') + '-' + dateStr + '.webm';
+
+      a.style.display = 'none';
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+
+      setTimeout(() => {
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+      }, 1000);
+
+      alert('Recording completed and downloaded!\\n\\nSaved file: ' + filename + '\\n\\nThis video file is ready to be uploaded directly to YouTube.');
     }
 
     // TOGGLE CC & BCC
@@ -1906,6 +2112,12 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
         <i class="fa-solid fa-hashtag text-indigo-400"></i>
         <span class="font-mono font-medium">${safeRoom}</span>
       </div>
+      <!-- Record Meeting Button -->
+      <button id="btn-toggle-record-guest" onclick="toggleMeetingRecording('guest')" class="px-2.5 sm:px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-rose-400 hover:text-rose-300 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm" title="Record meeting and save to your computer">
+        <span id="record-dot-guest" class="w-2 h-2 rounded-full bg-rose-500"></span>
+        <span id="record-text-guest">Record</span>
+        <span id="record-timer-guest" class="hidden font-mono text-[11px] text-white bg-rose-600/30 px-1 rounded">00:00</span>
+      </button>
       <button onclick="copyCurrentLink()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm">
         <i class="fa-solid fa-link text-indigo-400"></i>
         <span id="copy-text">Share</span>
@@ -2040,6 +2252,9 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
     }
 
     function onCallEnded() {
+      if (recorderMediaRecorder && recorderMediaRecorder.state !== 'inactive') {
+        stopMeetingRecording('guest');
+      }
       if (jitsiApi) {
         try { jitsiApi.dispose(); } catch (e) {}
         jitsiApi = null;
@@ -2060,6 +2275,192 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
         text.textContent = 'Copied!';
         setTimeout(() => { text.textContent = orig; }, 2000);
       });
+    }
+
+    // Client-side Local Screen & Meeting Recorder for Attendees/Guests
+    let recorderMediaRecorder = null;
+    let recorderRecordedChunks = [];
+    let recorderTimerInterval = null;
+    let recorderSeconds = 0;
+
+    async function toggleMeetingRecording(scope) {
+      if (recorderMediaRecorder && recorderMediaRecorder.state === 'recording') {
+        stopMeetingRecording(scope);
+      } else {
+        await startMeetingRecording(scope);
+      }
+    }
+
+    async function startMeetingRecording(scope) {
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+          alert('Screen recording is not supported in this browser. Please use Chrome, Edge, or Firefox on desktop.');
+          return;
+        }
+
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'browser',
+            frameRate: { ideal: 30, max: 60 }
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: 44100
+          }
+        });
+
+        let micStream = null;
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true
+            }
+          });
+        } catch (micErr) {
+          console.warn('Microphone access skipped or unavailable', micErr);
+        }
+
+        let mixedStream = displayStream;
+        const displayAudioTracks = displayStream.getAudioTracks();
+        const micAudioTracks = micStream ? micStream.getAudioTracks() : [];
+
+        if (displayAudioTracks.length > 0 && micAudioTracks.length > 0) {
+          try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const dest = audioCtx.createMediaStreamDestination();
+
+            const sysSource = audioCtx.createMediaStreamSource(new MediaStream([displayAudioTracks[0]]));
+            sysSource.connect(dest);
+
+            const micSource = audioCtx.createMediaStreamSource(new MediaStream([micAudioTracks[0]]));
+            micSource.connect(dest);
+
+            const combinedAudioTrack = dest.stream.getAudioTracks()[0];
+            mixedStream = new MediaStream([
+              displayStream.getVideoTracks()[0],
+              combinedAudioTrack
+            ]);
+          } catch (mixErr) {
+            console.warn('Audio mixing fallback', mixErr);
+            mixedStream = displayStream;
+          }
+        } else if (micAudioTracks.length > 0 && displayAudioTracks.length === 0) {
+          mixedStream = new MediaStream([
+            displayStream.getVideoTracks()[0],
+            micAudioTracks[0]
+          ]);
+        }
+
+        let mimeType = 'video/webm;codecs=vp9,opus';
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'video/webm;codecs=vp8,opus';
+        }
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'video/webm';
+        }
+
+        recorderRecordedChunks = [];
+        recorderMediaRecorder = new MediaRecorder(mixedStream, {
+          mimeType,
+          videoBitsPerSecond: 2500000
+        });
+
+        recorderMediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            recorderRecordedChunks.push(e.data);
+          }
+        };
+
+        recorderMediaRecorder.onstop = () => {
+          saveRecordingToDevice(scope);
+          displayStream.getTracks().forEach(t => t.stop());
+          if (micStream) micStream.getTracks().forEach(t => t.stop());
+        };
+
+        displayStream.getVideoTracks()[0].onended = () => {
+          if (recorderMediaRecorder && recorderMediaRecorder.state !== 'inactive') {
+            stopMeetingRecording(scope);
+          }
+        };
+
+        recorderMediaRecorder.start(1000);
+        updateRecordingUI(scope, true);
+
+        recorderSeconds = 0;
+        clearInterval(recorderTimerInterval);
+        recorderTimerInterval = setInterval(() => {
+          recorderSeconds++;
+          const mins = String(Math.floor(recorderSeconds / 60)).padStart(2, '0');
+          const secs = String(recorderSeconds % 60).padStart(2, '0');
+          const timerEl = document.getElementById('record-timer-' + scope);
+          if (timerEl) timerEl.textContent = mins + ':' + secs;
+        }, 1000);
+
+      } catch (err) {
+        console.error('Recording initialization error:', err);
+        if (err.name !== 'NotAllowedError') {
+          alert('Could not start screen recording: ' + err.message);
+        }
+        updateRecordingUI(scope, false);
+      }
+    }
+
+    function stopMeetingRecording(scope) {
+      if (recorderMediaRecorder && recorderMediaRecorder.state !== 'inactive') {
+        recorderMediaRecorder.stop();
+      }
+      clearInterval(recorderTimerInterval);
+      updateRecordingUI(scope, false);
+    }
+
+    function updateRecordingUI(scope, isRecording) {
+      const btn = document.getElementById('btn-toggle-record-' + scope);
+      const dot = document.getElementById('record-dot-' + scope);
+      const text = document.getElementById('record-text-' + scope);
+      const timer = document.getElementById('record-timer-' + scope);
+
+      if (!btn) return;
+
+      if (isRecording) {
+        btn.classList.add('bg-rose-950/80', 'border-rose-500', 'text-rose-300');
+        btn.classList.remove('bg-slate-800', 'border-slate-700');
+        if (dot) dot.classList.add('animate-ping');
+        if (text) text.textContent = 'Stop Rec';
+        if (timer) {
+          timer.classList.remove('hidden');
+          timer.textContent = '00:00';
+        }
+      } else {
+        btn.classList.remove('bg-rose-950/80', 'border-rose-500', 'text-rose-300');
+        btn.classList.add('bg-slate-800', 'border-slate-700');
+        if (dot) dot.classList.remove('animate-ping');
+        if (text) text.textContent = 'Record';
+        if (timer) timer.classList.add('hidden');
+      }
+    }
+
+    function saveRecordingToDevice(scope) {
+      if (recorderRecordedChunks.length === 0) return;
+      const blob = new Blob(recorderRecordedChunks, { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const dateStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const filename = 'devgeeksnexus-training-' + roomName + '-' + dateStr + '.webm';
+
+      a.style.display = 'none';
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+
+      setTimeout(() => {
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+      }, 1000);
+
+      alert('Recording completed and downloaded to your device!\\n\\nSaved file: ' + filename + '\\n\\nReady to be uploaded to YouTube.');
     }
   </script>
 </body>
