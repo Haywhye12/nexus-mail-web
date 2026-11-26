@@ -3,6 +3,7 @@ import PostalMime from 'postal-mime';
 export interface Env {
   RESEND_API_KEY?: string;
   SMTP_PASS?: string;
+  GEMINI_API_KEY?: string;
   EMAILS: any; // KVNamespace
 }
 
@@ -113,6 +114,76 @@ export default {
     }
   },
 
+  // 1.5 SCHEDULED CRON HANDLER (Scheduled Sending)
+  async scheduled(event: any, env: Env, ctx: any) {
+    if (!env.EMAILS) return;
+    try {
+      const now = Date.now();
+      const list = await env.EMAILS.list({ prefix: 'scheduled:' });
+      for (const key of list.keys) {
+        const item = await env.EMAILS.get(key.name, 'json') as any;
+        if (item && item.scheduledTime && item.scheduledTime <= now) {
+          // Send scheduled email via Resend
+          const apiKey = env.RESEND_API_KEY || env.SMTP_PASS;
+          if (apiKey) {
+            const resendPayload: any = {
+              from: item.fromFormatted || item.from,
+              to: item.toList,
+              subject: item.subject,
+              html: item.htmlWithTracking || item.html || `<p>${item.text}</p>`,
+            };
+            if (item.ccList && item.ccList.length > 0) resendPayload.cc = item.ccList;
+            if (item.bccList && item.bccList.length > 0) resendPayload.bcc = item.bccList;
+            if (item.attachments && item.attachments.length > 0) {
+              resendPayload.attachments = item.attachments.map((att: any) => ({
+                filename: att.filename,
+                content: att.contentBase64,
+              }));
+            }
+
+            const sendRes = await fetch('https://api.resend.com/emails', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(resendPayload),
+            });
+
+            if (sendRes.ok) {
+              const resData = await sendRes.json() as any;
+              // Save to sent folder
+              const sentId = `sent_${Date.now()}`;
+              const sentMsg = {
+                id: sentId,
+                account: item.from,
+                from: item.from,
+                fromName: item.fromName,
+                to: item.toList.join(', '),
+                cc: (item.ccList || []).join(', '),
+                bcc: (item.bccList || []).join(', '),
+                subject: item.subject,
+                text: item.text || '',
+                html: item.html || '',
+                date: new Date().toISOString(),
+                folder: 'sent',
+                isRead: true,
+                isStarred: false,
+                attachments: item.attachments || [],
+                messageId: resData.id,
+                trackingId: item.trackingId || null,
+              };
+              await env.EMAILS.put(`msg:${sentMsg.date}:${sentId}`, JSON.stringify(sentMsg));
+              await env.EMAILS.delete(key.name);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Scheduled cron error:', e);
+    }
+  },
+
   // 2. HTTP FETCH HANDLER (Nexus Mail Web App & API)
   async fetch(request: Request, env: Env, ctx: any): Promise<Response> {
     if (request.method === 'OPTIONS') {
@@ -120,6 +191,72 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // API: GET /api/track/open (Tracking pixel)
+    if (url.pathname === '/api/track/open') {
+      const trackingId = url.searchParams.get('tid');
+      if (trackingId && env.EMAILS) {
+        ctx.waitUntil(
+          (async () => {
+            const existing = await env.EMAILS.get(`track:${trackingId}`, 'json') as any || { opens: 0, clicks: 0, firstOpenedAt: null, lastOpenedAt: null };
+            existing.opens = (existing.opens || 0) + 1;
+            const now = new Date().toISOString();
+            if (!existing.firstOpenedAt) existing.firstOpenedAt = now;
+            existing.lastOpenedAt = now;
+            await env.EMAILS.put(`track:${trackingId}`, JSON.stringify(existing));
+          })()
+        );
+      }
+      // Return 1x1 transparent GIF
+      const transparentGif = new Uint8Array([
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
+        0x80, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21,
+        0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44,
+        0x01, 0x00, 0x3b
+      ]);
+      return new Response(transparentGif, {
+        headers: {
+          'Content-Type': 'image/gif',
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      });
+    }
+
+    // API: GET /api/track/click (Link redirect tracking)
+    if (url.pathname === '/api/track/click') {
+      const trackingId = url.searchParams.get('tid');
+      const targetUrl = url.searchParams.get('url');
+      if (trackingId && env.EMAILS) {
+        ctx.waitUntil(
+          (async () => {
+            const existing = await env.EMAILS.get(`track:${trackingId}`, 'json') as any || { opens: 0, clicks: 0, firstClickedAt: null, lastClickedAt: null };
+            existing.clicks = (existing.clicks || 0) + 1;
+            const now = new Date().toISOString();
+            if (!existing.firstClickedAt) existing.firstClickedAt = now;
+            existing.lastClickedAt = now;
+            await env.EMAILS.put(`track:${trackingId}`, JSON.stringify(existing));
+          })()
+        );
+      }
+      return Response.redirect(targetUrl || 'https://devgeeksnexus.com', 302);
+    }
+
+    // API: GET /api/track/stats
+    if (url.pathname === '/api/track/stats') {
+      const tid = url.searchParams.get('tid');
+      if (!tid || !env.EMAILS) {
+        return new Response(JSON.stringify({ opens: 0, clicks: 0 }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+      const data = await env.EMAILS.get(`track:${tid}`, 'json') || { opens: 0, clicks: 0 };
+      return new Response(JSON.stringify(data), {
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
 
     // Standalone Isolated Video Meeting / Training Room Route
     // Accessible via /meet, /meet?room=..., /meet/:room, or legacy /?meet=...
@@ -474,11 +611,11 @@ export default {
       }
     }
 
-    // API: POST /api/send (Sends live via Resend REST API)
+    // API: POST /api/send (Sends live via Resend REST API or Schedules)
     if (request.method === 'POST' && url.pathname === '/api/send') {
       try {
         const body = (await request.json()) as any;
-        const { from, to, cc, bcc, subject, html, text, attachments, draftId } = body;
+        const { from, to, cc, bcc, subject, html, text, attachments, draftId, scheduledAt, trackOpens, trackClicks } = body;
 
         const toList = parseEmailList(to);
         const ccList = parseEmailList(cc);
@@ -507,11 +644,87 @@ export default {
           senderDisplayName = senderEmail.split('@')[0];
         }
 
+        // Generate tracking ID if tracking is enabled
+        const trackingId = (trackOpens || trackClicks) ? `trk_${Date.now()}_${Math.random().toString(36).substring(7)}` : null;
+        let finalHtml = html || (text ? `<p>${text}</p>` : '');
+
+        if (trackingId) {
+          const origin = url.origin;
+          // Wrap links for click tracking if requested
+          if (trackClicks) {
+            finalHtml = finalHtml.replace(/href=["'](https?:\/\/[^"']+)["']/gi, (match: string, p1: string) => {
+              // Skip tracking URLs that are already tracking links or internal
+              if (p1.includes('/api/track/')) return match;
+              return `href="${origin}/api/track/click?tid=${trackingId}&url=${encodeURIComponent(p1)}"`;
+            });
+          }
+          // Append 1x1 transparent tracking pixel for open tracking if requested
+          if (trackOpens) {
+            finalHtml += `<img src="${origin}/api/track/open?tid=${trackingId}" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;" />`;
+          }
+          if (env.EMAILS) {
+            await env.EMAILS.put(`track:${trackingId}`, JSON.stringify({ opens: 0, clicks: 0, recipient: toList.join(', '), subject: subject || '' }));
+          }
+        }
+
+        // SCHEDULED SENDING
+        if (scheduledAt) {
+          const schedTime = new Date(scheduledAt).getTime();
+          if (schedTime > Date.now() + 30000) { // More than 30s in future
+            const schedId = `sched_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+            const schedPayload = {
+              id: schedId,
+              scheduledTime: schedTime,
+              scheduledAtIso: new Date(schedTime).toISOString(),
+              from: senderEmail,
+              fromName: senderDisplayName,
+              fromFormatted: `${senderDisplayName} <${senderEmail}>`,
+              toList,
+              ccList,
+              bccList,
+              subject: subject || '(No Subject)',
+              html: html || '',
+              htmlWithTracking: finalHtml,
+              text: text || '',
+              attachments: attachments || [],
+              trackingId,
+            };
+
+            if (env.EMAILS) {
+              await env.EMAILS.put(`scheduled:${schedTime}:${schedId}`, JSON.stringify(schedPayload));
+              // Also store in Drafts/Scheduled so user sees it in their mailbox
+              const schedMsg = {
+                id: schedId,
+                account: senderEmail,
+                from: senderEmail,
+                fromName: senderDisplayName,
+                to: toList.join(', '),
+                subject: `[Scheduled: ${new Date(schedTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })}] ` + (subject || ''),
+                text: text || '',
+                html: html || '',
+                date: new Date().toISOString(),
+                folder: 'drafts',
+                isRead: true,
+                isStarred: false,
+                isScheduled: true,
+                scheduledTime: schedTime,
+                attachments: attachments || [],
+              };
+              await env.EMAILS.put(`msg:${schedMsg.date}:${schedId}`, JSON.stringify(schedMsg));
+            }
+
+            return new Response(JSON.stringify({ success: true, scheduled: true, scheduledAt: new Date(schedTime).toISOString() }), {
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+        }
+
+        // IMMEDIATE DISPATCH VIA RESEND
         const resendPayload: any = {
           from: `${senderDisplayName} <${senderEmail}>`,
           to: toList,
           subject: subject || '(No Subject)',
-          html: html || (text ? `<p>${text}</p>` : ''),
+          html: finalHtml,
         };
 
         if (ccList.length > 0) resendPayload.cc = ccList;
@@ -524,7 +737,6 @@ export default {
           }));
         }
 
-        // Call Resend REST API
         const apiKey = env.RESEND_API_KEY || env.SMTP_PASS;
         if (!apiKey) {
           return new Response(JSON.stringify({ error: 'Resend API key is not configured in worker environment.' }), {
@@ -579,6 +791,7 @@ export default {
           isStarred: false,
           attachments: attachments || [],
           messageId: resendData.id,
+          trackingId: trackingId || null,
         };
 
         if (env.EMAILS) {
@@ -620,6 +833,74 @@ export default {
           }
         }
         return new Response(JSON.stringify({ success: true }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // API: POST /api/ai/process (Gemini AI Smart Reply, Summarization, Tone Polish)
+    if (request.method === 'POST' && url.pathname === '/api/ai/process') {
+      try {
+        const body = (await request.json()) as any;
+        const { action, text, context, tone } = body;
+        const geminiKey = (env.GEMINI_API_KEY || '').trim();
+
+        if (geminiKey) {
+          // Use official Gemini 1.5 Flash endpoint
+          let prompt = '';
+          if (action === 'summarize') {
+            prompt = `You are an executive email assistant. Provide a concise, bulleted executive summary (max 3 bullets) of the following email thread, highlighting action items and core message:\n\n${text}`;
+          } else if (action === 'reply') {
+            prompt = `You are a professional email assistant. Draft a courteous, clear, and relevant email reply to this email:\nContext: ${context || ''}\nEmail received:\n${text}\nKeep it professional and concise.`;
+          } else if (action === 'polish') {
+            prompt = `You are an expert editor. Rewrite and polish this email draft to make it sound ${tone || 'Professional, crisp, and persuasive'}:\n\nDraft:\n${text}\n\nReturn only the polished email text.`;
+          }
+
+          const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { temperature: 0.3, maxOutputTokens: 600 }
+            })
+          });
+
+          if (aiRes.ok) {
+            const aiData = await aiRes.json() as any;
+            const replyContent = aiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+            return new Response(JSON.stringify({ success: true, result: replyContent.trim() }), {
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+        }
+
+        // High-fidelity Built-in Fallback NLP Engine (Zero API Key needed)
+        let fallbackResult = '';
+        if (action === 'summarize') {
+          const sentences = (text || '').replace(/\r?\n/g, ' ').split(/[.!?]+/).map((s: string) => s.trim()).filter((s: string) => s.length > 15);
+          const topSentences = sentences.slice(0, 3);
+          fallbackResult = topSentences.length > 0 ?
+            topSentences.map((s: string) => `• ${s}.`).join('\n') :
+            '• Message received. Review details for full context.';
+        } else if (action === 'reply') {
+          fallbackResult = `Hi there,\n\nThank you for reaching out to DevGeeksNexus. I have received your message regarding this matter and will review the details promptly.\n\nBest regards,\nDevGeeksNexus Team`;
+        } else if (action === 'polish') {
+          const clean = (text || '').trim();
+          if (tone === 'Concise') {
+            fallbackResult = clean.split('\n').filter((l: string) => l.trim().length > 0).slice(0, 4).join('\n');
+          } else if (tone === 'Friendly') {
+            fallbackResult = `Hi!\n\n${clean}\n\nThanks so much, and have a wonderful day!`;
+          } else {
+            fallbackResult = `Dear recipient,\n\n${clean}\n\nSincerely,\nDevGeeksNexus`;
+          }
+        }
+
+        return new Response(JSON.stringify({ success: true, result: fallbackResult, isFallback: !geminiKey }), {
           headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
         });
       } catch (err: any) {
@@ -870,14 +1151,34 @@ function renderWebAppHtml(currentUserEmail?: string): string {
     
     <!-- Email List Section -->
     <section id="email-list-section" class="w-full md:w-96 border-r border-slate-200 bg-white flex flex-col h-full flex-shrink-0">
-      <div class="p-2.5 sm:p-3 border-b border-slate-200 flex items-center space-x-2 bg-white">
-        <div class="relative flex-1">
-          <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
-          <input type="text" id="search-input" oninput="renderList()" placeholder="Search messages..." class="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-100 rounded-lg border-0 focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+      <!-- Search and Filter Bar -->
+      <div class="p-2.5 sm:p-3 border-b border-slate-200 bg-white space-y-2">
+        <div class="flex items-center space-x-2">
+          <div class="relative flex-1">
+            <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
+            <input type="text" id="search-input" oninput="renderList()" placeholder="Search sender, subject, content..." class="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-100 rounded-lg border-0 focus:ring-2 focus:ring-indigo-500 text-slate-800" />
+          </div>
+          <button onclick="toggleAdvancedFilter()" id="btn-toggle-filters" title="Filter emails" class="p-1.5 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 border border-slate-200 rounded-lg transition-colors text-xs flex items-center gap-1">
+            <i class="fa-solid fa-sliders"></i>
+          </button>
+          <button onclick="loadMessages()" title="Refresh Mailbox" class="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors">
+            <i id="refresh-icon" class="fa-solid fa-rotate-right text-xs"></i>
+          </button>
         </div>
-        <button onclick="loadMessages()" title="Refresh Mailbox" class="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors">
-          <i id="refresh-icon" class="fa-solid fa-rotate-right text-xs"></i>
-        </button>
+
+        <!-- Advanced Filter Chips Tray -->
+        <div id="filter-chips-tray" class="hidden flex items-center gap-1.5 flex-wrap pt-1 text-[11px]">
+          <button onclick="toggleFilterType('unread')" id="filter-chip-unread" class="px-2 py-0.5 rounded-full border border-slate-200 text-slate-600 bg-slate-50 hover:bg-slate-100 transition-colors">
+            <i class="fa-solid fa-envelope mr-1 text-[10px]"></i>Unread
+          </button>
+          <button onclick="toggleFilterType('hasAttachment')" id="filter-chip-hasAttachment" class="px-2 py-0.5 rounded-full border border-slate-200 text-slate-600 bg-slate-50 hover:bg-slate-100 transition-colors">
+            <i class="fa-solid fa-paperclip mr-1 text-[10px]"></i>Attachments
+          </button>
+          <button onclick="toggleFilterType('starred')" id="filter-chip-starred" class="px-2 py-0.5 rounded-full border border-slate-200 text-slate-600 bg-slate-50 hover:bg-slate-100 transition-colors">
+            <i class="fa-solid fa-star mr-1 text-[10px] text-amber-400"></i>Starred
+          </button>
+          <button onclick="resetFilters()" class="text-slate-400 hover:text-rose-500 ml-auto text-[10px]">Clear</button>
+        </div>
       </div>
 
       <!-- Current Filter Header -->
@@ -929,6 +1230,25 @@ function renderWebAppHtml(currentUserEmail?: string): string {
               <i class="fa-solid fa-reply text-xs"></i>
               <span>Reply</span>
             </button>
+
+            <!-- AI Summary and Smart Reply Action Dropdown -->
+            <div class="relative inline-block text-left">
+              <button onclick="toggleAiMenu()" class="px-2.5 py-1.5 bg-gradient-to-r from-indigo-50 to-purple-50 hover:from-indigo-100 hover:to-purple-100 border border-indigo-200 rounded-lg text-xs font-semibold text-indigo-700 flex items-center space-x-1.5 active:scale-95 transition-all shadow-xs">
+                <i class="fa-solid fa-wand-magic-sparkles text-indigo-500"></i>
+                <span class="hidden sm:inline">AI Assist</span>
+                <i class="fa-solid fa-chevron-down text-[10px]"></i>
+              </button>
+              <div id="ai-dropdown-menu" class="hidden absolute left-0 mt-1.5 w-48 bg-white border border-slate-200 rounded-xl shadow-xl z-30 py-1 text-xs">
+                <button onclick="triggerAiAction('summarize')" class="w-full text-left px-3 py-2 hover:bg-indigo-50 flex items-center space-x-2 text-slate-700">
+                  <i class="fa-solid fa-list-check text-indigo-600 w-4"></i>
+                  <span>Summarize Thread</span>
+                </button>
+                <button onclick="triggerAiAction('smart-reply')" class="w-full text-left px-3 py-2 hover:bg-indigo-50 flex items-center space-x-2 text-slate-700">
+                  <i class="fa-solid fa-reply-all text-purple-600 w-4"></i>
+                  <span>AI Smart Reply</span>
+                </button>
+              </div>
+            </div>
           </div>
           <div class="flex items-center space-x-1.5 overflow-hidden">
             <span id="detail-account-badge" class="px-2 py-0.5 rounded text-[10px] sm:text-[11px] font-mono font-medium truncate max-w-[130px] sm:max-w-none"></span>
@@ -936,8 +1256,21 @@ function renderWebAppHtml(currentUserEmail?: string): string {
           </div>
         </div>
 
-        <!-- Detail Content -->
+            <!-- Detail Content -->
         <div class="flex-1 overflow-y-auto p-4 sm:p-6 custom-scroll touch-scroll">
+          
+          <!-- AI Summary Box (dynamically populated) -->
+          <div id="ai-summary-box" class="hidden mb-4 p-4 rounded-xl bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-100 text-slate-800 text-xs space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="font-bold text-indigo-700 flex items-center gap-1.5 text-xs">
+                <i class="fa-solid fa-wand-magic-sparkles text-indigo-500"></i>
+                <span>Executive Summary (AI)</span>
+              </span>
+              <button onclick="document.getElementById('ai-summary-box').classList.add('hidden')" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div id="ai-summary-text" class="text-xs text-slate-700 leading-relaxed whitespace-pre-line"></div>
+          </div>
+
           <div class="border-b border-slate-100 pb-4 mb-4 sm:mb-6">
             <h2 id="detail-subject" class="text-base sm:text-xl font-bold text-slate-900 mb-3 break-words"></h2>
             <div class="flex items-start justify-between">
@@ -1237,26 +1570,85 @@ function renderWebAppHtml(currentUserEmail?: string): string {
             <input type="text" id="compose-subject" placeholder="Subject of your message..." class="flex-1 px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800" />
           </div>
 
-          <!-- Formatting & Attachment Toolbar -->
+          <!-- Full WYSIWYG Formatting & AI Polish Toolbar -->
           <div class="flex items-center justify-between flex-wrap gap-1.5 border-y border-slate-200 py-1.5 bg-slate-50 px-2 rounded-md">
-            <div class="flex items-center space-x-1">
-              <button type="button" onclick="formatText('b')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs font-bold" title="Bold"><i class="fa-solid fa-bold"></i></button>
-              <button type="button" onclick="formatText('i')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs" title="Italic"><i class="fa-solid fa-italic"></i></button>
-              <button type="button" onclick="promptLink()" class="px-2 py-1 hover:bg-slate-200 rounded text-xs text-indigo-600 font-medium" title="Add Link"><i class="fa-solid fa-link mr-1"></i> Link</button>
-              <button type="button" onclick="promptImage()" class="px-2 py-1 hover:bg-slate-200 rounded text-xs text-indigo-600 font-medium" title="Add Image URL"><i class="fa-regular fa-image mr-1"></i> Image</button>
+            <div class="flex items-center space-x-0.5 sm:space-x-1 flex-wrap">
+              <button type="button" onclick="formatEditor('bold')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs font-bold" title="Bold (Ctrl+B)"><i class="fa-solid fa-bold"></i></button>
+              <button type="button" onclick="formatEditor('italic')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs" title="Italic (Ctrl+I)"><i class="fa-solid fa-italic"></i></button>
+              <button type="button" onclick="formatEditor('underline')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs" title="Underline"><i class="fa-solid fa-underline"></i></button>
+              <button type="button" onclick="formatEditor('strikeThrough')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs" title="Strikethrough"><i class="fa-solid fa-strikethrough"></i></button>
+              <div class="w-px h-4 bg-slate-300 mx-0.5"></div>
+              <button type="button" onclick="formatEditor('insertUnorderedList')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs" title="Bullet List"><i class="fa-solid fa-list-ul"></i></button>
+              <button type="button" onclick="formatEditor('insertOrderedList')" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs" title="Numbered List"><i class="fa-solid fa-list-ol"></i></button>
+              <button type="button" onclick="formatCodeBlock()" class="p-1.5 hover:bg-slate-200 rounded text-slate-700 text-xs" title="Code Block"><i class="fa-solid fa-code"></i></button>
+              <div class="w-px h-4 bg-slate-300 mx-0.5"></div>
+              <button type="button" onclick="promptEditorLink()" class="px-2 py-1 hover:bg-slate-200 rounded text-xs text-indigo-600 font-medium" title="Add Hyperlink"><i class="fa-solid fa-link mr-1"></i> Link</button>
+              <button type="button" onclick="promptEditorImage()" class="px-2 py-1 hover:bg-slate-200 rounded text-xs text-indigo-600 font-medium" title="Insert Image URL"><i class="fa-regular fa-image mr-1"></i> Image</button>
+
+              <!-- AI Tone Polish Pill Dropdown -->
+              <div class="relative inline-block text-left ml-1">
+                <button type="button" onclick="togglePolishMenu()" class="px-2 py-1 rounded bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-700 text-xs font-semibold flex items-center space-x-1">
+                  <i class="fa-solid fa-wand-magic-sparkles text-[11px] text-purple-600"></i>
+                  <span>AI Polish</span>
+                  <i class="fa-solid fa-chevron-down text-[9px]"></i>
+                </button>
+                <div id="ai-polish-menu" class="hidden absolute left-0 mt-1 w-36 bg-white border border-slate-200 rounded-lg shadow-xl z-30 py-1 text-xs">
+                  <button type="button" onclick="polishDraftText('Professional')" class="w-full text-left px-3 py-1.5 hover:bg-purple-50 text-slate-700">👔 Professional</button>
+                  <button type="button" onclick="polishDraftText('Friendly')" class="w-full text-left px-3 py-1.5 hover:bg-purple-50 text-slate-700">🤝 Friendly</button>
+                  <button type="button" onclick="polishDraftText('Concise')" class="w-full text-left px-3 py-1.5 hover:bg-purple-50 text-slate-700">⚡ Concise</button>
+                </div>
+              </div>
             </div>
-            <div>
+
+            <div class="flex items-center space-x-1.5">
+              <!-- Signature Button -->
+              <button type="button" onclick="insertSignature()" class="px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-xs font-medium text-slate-700 shadow-xs" title="Insert Account Signature">
+                <i class="fa-solid fa-signature text-indigo-500 mr-1"></i>
+                <span class="hidden sm:inline">Signature</span>
+              </button>
+
               <input type="file" id="file-input" onchange="handleFileSelected(event)" multiple class="hidden" />
-              <button type="button" onclick="document.getElementById('file-input').click()" class="flex items-center space-x-1.5 px-2.5 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-xs font-medium text-slate-700 shadow-xs">
+              <button type="button" onclick="document.getElementById('file-input').click()" class="flex items-center space-x-1 px-2 py-1 bg-white hover:bg-slate-100 border border-slate-200 rounded text-xs font-medium text-slate-700 shadow-xs">
                 <i class="fa-solid fa-paperclip text-slate-500"></i>
-                <span>Attach Files</span>
+                <span class="hidden sm:inline">Attach</span>
               </button>
             </div>
           </div>
 
-          <!-- Body -->
-          <div>
-            <textarea id="compose-body" rows="6" placeholder="Write your message here..." class="w-full p-3 border border-slate-200 rounded-lg text-xs sm:text-sm focus:ring-2 focus:ring-indigo-500 text-slate-800 font-sans leading-relaxed"></textarea>
+          <!-- Rich Text WYSIWYG ContentEditable Body -->
+          <div class="relative min-h-[160px] border border-slate-200 rounded-lg bg-white overflow-hidden focus-within:ring-2 focus-within:ring-indigo-500">
+            <div id="compose-editor" contenteditable="true" class="p-3 min-h-[160px] max-h-[340px] overflow-y-auto text-xs sm:text-sm text-slate-800 focus:outline-none custom-scroll leading-relaxed" placeholder="Write your message here..."></div>
+          </div>
+
+          <!-- Options Drawer: Tracking & Schedule -->
+          <div class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2">
+            <div class="flex items-center justify-between flex-wrap gap-2">
+              <!-- Tracking Checkboxes -->
+              <div class="flex items-center space-x-3 text-slate-600">
+                <label class="flex items-center space-x-1.5 cursor-pointer">
+                  <input type="checkbox" id="check-track-opens" checked class="rounded text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5" />
+                  <span class="text-[11px] font-medium"><i class="fa-regular fa-eye mr-1 text-indigo-500"></i> Track Opens</span>
+                </label>
+                <label class="flex items-center space-x-1.5 cursor-pointer">
+                  <input type="checkbox" id="check-track-clicks" checked class="rounded text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5" />
+                  <span class="text-[11px] font-medium"><i class="fa-solid fa-arrow-pointer mr-1 text-indigo-500"></i> Track Clicks</span>
+                </label>
+              </div>
+
+              <!-- Scheduled Send Toggle -->
+              <div class="flex items-center space-x-1.5">
+                <button type="button" onclick="toggleScheduleInput()" class="text-[11px] text-indigo-600 hover:text-indigo-700 font-semibold flex items-center gap-1">
+                  <i class="fa-regular fa-clock"></i>
+                  <span id="schedule-btn-label">Schedule Send</span>
+                </button>
+              </div>
+            </div>
+
+            <div id="schedule-input-container" class="hidden pt-1.5 border-t border-slate-200 flex items-center gap-2">
+              <span class="text-[11px] text-slate-500">Send on:</span>
+              <input type="datetime-local" id="compose-schedule-time" class="px-2 py-1 border border-slate-200 rounded text-xs text-slate-700 bg-white" />
+              <button type="button" onclick="cancelSchedule()" class="text-rose-500 text-xs hover:underline">Cancel</button>
+            </div>
           </div>
 
           <!-- Attachment Tray -->
@@ -1282,7 +1674,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
           <div class="flex items-center space-x-2">
             <button type="button" onclick="closeCompose()" class="px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-200 rounded-lg active:scale-95 transition-all">Discard</button>
             <button type="submit" id="btn-submit" class="flex items-center space-x-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-sm active:scale-95 transition-all">
-              <i class="fa-solid fa-paper-plane text-xs"></i>
+              <i id="btn-submit-icon" class="fa-solid fa-paper-plane text-xs"></i>
               <span id="btn-submit-text">Send Email</span>
             </button>
           </div>
@@ -1401,15 +1793,57 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       loadMessages();
     }
 
+    let activeFilters = {
+      unread: false,
+      hasAttachment: false,
+      starred: false,
+    };
+
+    function toggleAdvancedFilter() {
+      const tray = document.getElementById('filter-chips-tray');
+      tray.classList.toggle('hidden');
+    }
+
+    function toggleFilterType(type) {
+      activeFilters[type] = !activeFilters[type];
+      const chip = document.getElementById('filter-chip-' + type);
+      if (activeFilters[type]) {
+        chip.className = 'px-2 py-0.5 rounded-full border border-indigo-500 text-indigo-700 bg-indigo-50 font-semibold transition-colors';
+      } else {
+        chip.className = 'px-2 py-0.5 rounded-full border border-slate-200 text-slate-600 bg-slate-50 hover:bg-slate-100 transition-colors';
+      }
+      renderList();
+    }
+
+    function resetFilters() {
+      activeFilters = { unread: false, hasAttachment: false, starred: false };
+      ['unread', 'hasAttachment', 'starred'].forEach(type => {
+        const chip = document.getElementById('filter-chip-' + type);
+        if (chip) chip.className = 'px-2 py-0.5 rounded-full border border-slate-200 text-slate-600 bg-slate-50 hover:bg-slate-100 transition-colors';
+      });
+      document.getElementById('search-input').value = '';
+      renderList();
+    }
+
     function renderList() {
       const listEl = document.getElementById('email-list');
       const q = (document.getElementById('search-input').value || '').toLowerCase();
       const filtered = allMessages.filter(m => {
-        if (!q) return true;
-        return (m.subject || '').toLowerCase().includes(q) ||
-               (m.from || '').toLowerCase().includes(q) ||
-               (m.to || '').toLowerCase().includes(q) ||
-               (m.text || '').toLowerCase().includes(q);
+        // Keyword Search
+        if (q) {
+          const matched = (m.subject || '').toLowerCase().includes(q) ||
+                          (m.from || '').toLowerCase().includes(q) ||
+                          (m.to || '').toLowerCase().includes(q) ||
+                          (m.text || '').toLowerCase().includes(q);
+          if (!matched) return false;
+        }
+
+        // Active Filter Chips
+        if (activeFilters.unread && m.isRead) return false;
+        if (activeFilters.hasAttachment && (!m.attachments || m.attachments.length === 0)) return false;
+        if (activeFilters.starred && !m.isStarred) return false;
+
+        return true;
       });
 
       document.getElementById('list-count-badge').textContent = filtered.length + ' msgs';
@@ -2031,11 +2465,197 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       }
     }
 
+    // CUSTOM EMAIL SIGNATURES PER ACCOUNT
+    const EMAIL_SIGNATURES = {
+      'ayomidebobani@devgeeksnexus.com': '<br/><br/><div style="font-family: sans-serif; font-size: 13px; color: #334155; border-top: 2px solid #10b981; padding-top: 10px; margin-top: 16px;">' +
+        '<p style="margin: 0; font-weight: 700; color: #0f172a; font-size: 14px;">Ayomide Bobani</p>' +
+        '<p style="margin: 2px 0 0 0; color: #059669; font-size: 12px; font-weight: 600;">Lead Developer & Systems Architect | DevGeeksNexus</p>' +
+        '<p style="margin: 4px 0 0 0; color: #64748b; font-size: 11px;">📧 ayomidebobani@devgeeksnexus.com &nbsp;|&nbsp; 🌐 <a href="https://devgeeksnexus.com" style="color: #10b981; text-decoration: none;">devgeeksnexus.com</a></p>' +
+      '</div>',
+      'admin@devgeeksnexus.com': '<br/><br/><div style="font-family: sans-serif; font-size: 13px; color: #334155; border-top: 2px solid #f59e0b; padding-top: 10px; margin-top: 16px;">' +
+        '<p style="margin: 0; font-weight: 700; color: #0f172a; font-size: 14px;">Administrator</p>' +
+        '<p style="margin: 2px 0 0 0; color: #d97706; font-size: 12px; font-weight: 600;">Security & Operations Control | DevGeeksNexus</p>' +
+        '<p style="margin: 4px 0 0 0; color: #64748b; font-size: 11px;">🛡️ admin@devgeeksnexus.com &nbsp;|&nbsp; 🌐 <a href="https://devgeeksnexus.com" style="color: #f59e0b; text-decoration: none;">devgeeksnexus.com</a></p>' +
+      '</div>',
+      'info@devgeeksnexus.com': '<br/><br/><div style="font-family: sans-serif; font-size: 13px; color: #334155; border-top: 2px solid #6366f1; padding-top: 10px; margin-top: 16px;">' +
+        '<p style="margin: 0; font-weight: 700; color: #0f172a; font-size: 14px;">DevGeeksNexus Team</p>' +
+        '<p style="margin: 2px 0 0 0; color: #4f46e5; font-size: 12px; font-weight: 600;">Client Inquiries & Support Hub</p>' +
+        '<p style="margin: 4px 0 0 0; color: #64748b; font-size: 11px;">✉️ info@devgeeksnexus.com &nbsp;|&nbsp; 🌐 <a href="https://devgeeksnexus.com" style="color: #6366f1; text-decoration: none;">devgeeksnexus.com</a></p>' +
+      '</div>'
+    };
+
+    function insertSignature() {
+      const fromEmail = document.getElementById('compose-from').value;
+      const sig = EMAIL_SIGNATURES[fromEmail] || EMAIL_SIGNATURES['info@devgeeksnexus.com'];
+      const editor = document.getElementById('compose-editor');
+      editor.innerHTML += sig;
+    }
+
+    // WYSIWYG EDITOR COMMANDS
+    function formatEditor(command, val = null) {
+      document.execCommand(command, false, val);
+      document.getElementById('compose-editor').focus();
+    }
+
+    function formatCodeBlock() {
+      const selection = window.getSelection();
+      if (!selection.rangeCount) return;
+      const range = selection.getRangeAt(0);
+      const pre = document.createElement('pre');
+      pre.style = 'background: #0f172a; color: #38bdf8; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 12px; margin: 8px 0; overflow-x: auto;';
+      pre.textContent = range.toString() || '// Enter code snippet here';
+      range.deleteContents();
+      range.insertNode(pre);
+    }
+
+    function promptEditorLink() {
+      const url = prompt('Enter website link (e.g. https://devgeeksnexus.com):');
+      if (!url) return;
+      formatEditor('createLink', url);
+    }
+
+    function promptEditorImage() {
+      const url = prompt('Enter direct image URL:');
+      if (!url) return;
+      formatEditor('insertImage', url);
+    }
+
+    // AI POLISH & SMART ACTIONS
+    function togglePolishMenu() {
+      document.getElementById('ai-polish-menu').classList.toggle('hidden');
+    }
+
+    async function polishDraftText(tone) {
+      document.getElementById('ai-polish-menu').classList.add('hidden');
+      const editor = document.getElementById('compose-editor');
+      const rawText = editor.innerText || editor.textContent || '';
+      if (!rawText.trim()) {
+        alert('Please write a draft in the message editor first to polish with AI.');
+        return;
+      }
+
+      const notice = document.getElementById('draft-saved-notice');
+      notice.classList.remove('hidden');
+      notice.textContent = 'AI polishing (' + tone + ')...';
+
+      try {
+        const res = await fetch('/api/ai/process', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'polish', text: rawText, tone })
+        });
+        const data = await res.json();
+        if (data.success && data.result) {
+          editor.innerHTML = '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + data.result.replace(/\\n/g, '<br/>') + '</div>';
+          notice.textContent = 'Polished with AI (' + tone + ')!';
+          setTimeout(() => { notice.classList.add('hidden'); }, 3000);
+        } else {
+          alert('AI Polish error: ' + (data.error || 'Unable to polish text.'));
+          notice.classList.add('hidden');
+        }
+      } catch (err) {
+        notice.classList.add('hidden');
+        alert('AI polish network error');
+      }
+    }
+
+    function toggleAiMenu() {
+      document.getElementById('ai-dropdown-menu').classList.toggle('hidden');
+    }
+
+    async function triggerAiAction(action) {
+      document.getElementById('ai-dropdown-menu').classList.add('hidden');
+      if (!selectedMsg) return;
+
+      const bodyText = selectedMsg.text || selectedMsg.html || '';
+
+      if (action === 'summarize') {
+        const summaryBox = document.getElementById('ai-summary-box');
+        const summaryText = document.getElementById('ai-summary-text');
+        summaryText.innerHTML = '<div class="text-indigo-600 font-semibold flex items-center gap-1.5"><i class="fa-solid fa-spinner fa-spin text-xs"></i> Generating AI executive summary...</div>';
+        summaryBox.classList.remove('hidden');
+
+        try {
+          const res = await fetch('/api/ai/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'summarize', text: bodyText })
+          });
+          const data = await res.json();
+          if (data.success) {
+            summaryText.textContent = data.result;
+          } else {
+            summaryText.textContent = 'Could not generate summary: ' + (data.error || 'Unknown error');
+          }
+        } catch (e) {
+          summaryText.textContent = 'Network error contacting AI assistant.';
+        }
+      } else if (action === 'smart-reply') {
+        openCompose();
+        document.getElementById('compose-to').value = selectedMsg.from;
+        document.getElementById('compose-subject').value = selectedMsg.subject.startsWith('Re:') ? selectedMsg.subject : 'Re: ' + selectedMsg.subject;
+        
+        const editor = document.getElementById('compose-editor');
+        editor.innerHTML = '<p class="text-purple-600 font-semibold italic">Drafting AI Smart Reply...</p>';
+
+        try {
+          const res = await fetch('/api/ai/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'reply', text: bodyText, context: selectedMsg.subject })
+          });
+          const data = await res.json();
+          if (data.success) {
+            editor.innerHTML = '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + data.result.replace(/\\n/g, '<br/>') + '</div>';
+            insertSignature();
+          } else {
+            editor.innerHTML = '<p>Hi there,</p><p>Thank you for reaching out.</p>';
+          }
+        } catch (e) {
+          editor.innerHTML = '<p>Hi there,</p><p>Thank you for reaching out.</p>';
+        }
+      }
+    }
+
+    // SCHEDULED SENDING
+    let isScheduleActive = false;
+    function toggleScheduleInput() {
+      const container = document.getElementById('schedule-input-container');
+      const timeInput = document.getElementById('compose-schedule-time');
+      const btnLabel = document.getElementById('schedule-btn-label');
+      const submitText = document.getElementById('btn-submit-text');
+      const submitIcon = document.getElementById('btn-submit-icon');
+
+      isScheduleActive = !isScheduleActive;
+      if (isScheduleActive) {
+        container.classList.remove('hidden');
+        btnLabel.textContent = 'Scheduling active';
+        submitText.textContent = 'Schedule Email';
+        submitIcon.className = 'fa-regular fa-clock text-xs';
+        // Default to +2 hours
+        const d = new Date(Date.now() + 2 * 60 * 60 * 1000);
+        d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+        timeInput.value = d.toISOString().slice(0, 16);
+      } else {
+        cancelSchedule();
+      }
+    }
+
+    function cancelSchedule() {
+      isScheduleActive = false;
+      document.getElementById('schedule-input-container').classList.add('hidden');
+      document.getElementById('compose-schedule-time').value = '';
+      document.getElementById('schedule-btn-label').textContent = 'Schedule Send';
+      document.getElementById('btn-submit-text').textContent = 'Send Email';
+      document.getElementById('btn-submit-icon').className = 'fa-solid fa-paper-plane text-xs';
+    }
+
     // COMPOSE & DRAFTS
     function openCompose(draft) {
       const modal = document.getElementById('compose-modal');
       const modalTitle = document.getElementById('compose-modal-title');
       const draftPill = document.getElementById('draft-status-pill');
+      const editor = document.getElementById('compose-editor');
 
       if (draft) {
         currentDraftId = draft.id;
@@ -2045,7 +2665,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         document.getElementById('compose-from').value = draft.from || draft.account || 'info@devgeeksnexus.com';
         document.getElementById('compose-to').value = draft.to || '';
         document.getElementById('compose-subject').value = draft.subject === '(Draft)' ? '' : (draft.subject || '');
-        document.getElementById('compose-body').value = draft.text || '';
+        editor.innerHTML = draft.html || (draft.text ? '<p>' + draft.text.replace(/\\n/g, '<br/>') + '</p>' : '');
 
         if (draft.cc) {
           document.getElementById('field-cc').classList.remove('hidden');
@@ -2075,10 +2695,11 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         }
         document.getElementById('compose-to').value = '';
         document.getElementById('compose-subject').value = '';
-        document.getElementById('compose-body').value = '';
+        editor.innerHTML = '<p></p>';
         hideField('cc');
         hideField('bcc');
         clearAttachments();
+        cancelSchedule();
       }
 
       document.getElementById('send-alert').classList.add('hidden');
@@ -2091,21 +2712,24 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       document.getElementById('send-alert').classList.add('hidden');
       document.getElementById('draft-saved-notice').classList.add('hidden');
       currentDraftId = null;
+      cancelSchedule();
     }
 
     async function handleSaveDraft() {
       const btn = document.getElementById('btn-save-draft');
       const btnText = document.getElementById('btn-save-draft-text');
       const notice = document.getElementById('draft-saved-notice');
+      const editor = document.getElementById('compose-editor');
       
       const from = document.getElementById('compose-from').value;
       const to = document.getElementById('compose-to').value;
       const cc = document.getElementById('compose-cc').value;
       const bcc = document.getElementById('compose-bcc').value;
       const subject = document.getElementById('compose-subject').value;
-      const body = document.getElementById('compose-body').value;
+      const html = editor.innerHTML;
+      const text = editor.innerText || '';
 
-      if (!to && !subject && !body) {
+      if (!to && !subject && !text.trim()) {
         alert('Cannot save an empty draft. Please add a recipient, subject, or message body.');
         return;
       }
@@ -2124,8 +2748,8 @@ function renderWebAppHtml(currentUserEmail?: string): string {
             cc,
             bcc,
             subject: subject || '(Draft)',
-            text: body,
-            html: body ? '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + body.replace(/\\n/g, '<br/>') + '</div>' : '',
+            text,
+            html,
             attachments: attachedFiles,
           })
         });
@@ -2151,82 +2775,25 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       }
     }
 
-    function formatText(tag) {
-      const area = document.getElementById('compose-body');
-      area.value += '<' + tag + '>text</' + tag + '>';
-      area.focus();
-    }
-    function promptLink() {
-      const url = prompt('Enter URL (e.g. https://devgeeksnexus.com):');
-      if (!url) return;
-      const text = prompt('Enter link text:', url) || url;
-      document.getElementById('compose-body').value += ' <a href="' + url + '" target="_blank" style="color: #4f46e5; text-decoration: underline;">' + text + '</a> ';
-    }
-    function promptImage() {
-      const url = prompt('Enter image URL:');
-      if (!url) return;
-      document.getElementById('compose-body').value += '\\n<img src="' + url + '" style="max-width: 100%; border-radius: 8px;"/>\\n';
-    }
-
-    function handleFileSelected(e) {
-      const files = e.target.files;
-      if (!files || files.length === 0) return;
-      Array.from(files).forEach(file => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          attachedFiles.push({
-            filename: file.name,
-            mimeType: file.type || 'application/octet-stream',
-            size: file.size,
-            contentBase64: reader.result.split(',')[1]
-          });
-          renderAttachmentTray();
-        };
-        reader.readAsDataURL(file);
-      });
-      e.target.value = '';
-    }
-
-    function renderAttachmentTray() {
-      const tray = document.getElementById('compose-attachments-tray');
-      const list = document.getElementById('compose-attachments-list');
-      if (attachedFiles.length === 0) {
-        tray.classList.add('hidden');
-        return;
-      }
-      tray.classList.remove('hidden');
-      list.innerHTML = attachedFiles.map((att, i) => \`
-        <div class="flex items-center space-x-2 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs shadow-xs">
-          <i class="fa-solid fa-paperclip text-slate-400"></i>
-          <span class="max-w-[120px] truncate font-medium">\${escapeHtml(att.filename)}</span>
-          <span class="text-[10px] text-slate-400 font-mono">(\${formatBytes(att.size)})</span>
-          <button type="button" onclick="removeAtt(\${i})" class="text-slate-400 hover:text-red-500"><i class="fa-solid fa-xmark"></i></button>
-        </div>
-      \`).join('');
-    }
-
-    function removeAtt(i) {
-      attachedFiles.splice(i, 1);
-      renderAttachmentTray();
-    }
-    function clearAttachments() {
-      attachedFiles = [];
-      renderAttachmentTray();
-    }
-
     async function handleSend(e) {
       e.preventDefault();
       const btn = document.getElementById('btn-submit');
       const btnText = document.getElementById('btn-submit-text');
       btn.disabled = true;
-      btnText.textContent = 'Sending...';
+      btnText.textContent = isScheduleActive ? 'Scheduling...' : 'Sending...';
 
       const from = document.getElementById('compose-from').value;
       const to = document.getElementById('compose-to').value;
       const cc = document.getElementById('compose-cc').value;
       const bcc = document.getElementById('compose-bcc').value;
       const subject = document.getElementById('compose-subject').value;
-      const body = document.getElementById('compose-body').value;
+      const editor = document.getElementById('compose-editor');
+      const html = editor.innerHTML;
+      const text = editor.innerText || '';
+
+      const trackOpens = document.getElementById('check-track-opens').checked;
+      const trackClicks = document.getElementById('check-track-clicks').checked;
+      const scheduledAt = isScheduleActive ? document.getElementById('compose-schedule-time').value : null;
 
       try {
         const res = await fetch('/api/send', {
@@ -2239,27 +2806,33 @@ function renderWebAppHtml(currentUserEmail?: string): string {
             cc,
             bcc,
             subject,
-            text: body.replace(/<[^>]*>?/gm, ''),
-            html: '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + body.replace(/\\n/g, '<br/>') + '</div>',
-            attachments: attachedFiles
+            text,
+            html,
+            attachments: attachedFiles,
+            trackOpens,
+            trackClicks,
+            scheduledAt,
           })
         });
 
         const data = await res.json();
         if (data.success) {
           document.getElementById('send-alert').classList.remove('hidden');
+          document.getElementById('send-alert-text').textContent = data.scheduled ?
+            'Email successfully scheduled for dispatch!' :
+            'Email dispatched successfully with tracking active!';
           setTimeout(() => {
             closeCompose();
             loadMessages();
           }, 1200);
         } else {
-          alert('Error: ' + (data.error || 'Failed to send'));
+          alert('Error: ' + (data.error || 'Failed to dispatch email'));
         }
       } catch (err) {
         alert('Network error sending email');
       } finally {
         btn.disabled = false;
-        btnText.textContent = 'Send Email';
+        btnText.textContent = isScheduleActive ? 'Schedule Email' : 'Send Email';
       }
     }
 

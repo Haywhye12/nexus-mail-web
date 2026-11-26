@@ -11,5 +11,8 @@
       "binding": "EMAILS",
       "id": "b9e9f6539550499da494013590b3b6ab"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
 }
