@@ -419,7 +419,20 @@ export default {
       }
     }
 
-    // Default: Serve the complete Nexus Suite (Mail + Google Meet-like Video Training)
+    // Standalone Isolated Video Meeting / Training Room Route
+    // Accessible via /meet, /meet?room=..., /meet/:room, or legacy /?meet=...
+    // Fully isolated from email: participants have ZERO access to emails or mailbox APIs
+    if (url.pathname.startsWith('/meet') || url.searchParams.has('meet')) {
+      const roomParam =
+        url.searchParams.get('room') ||
+        url.searchParams.get('meet') ||
+        url.pathname.replace(/^\/meet\/?/, '').trim();
+      return new Response(renderStandaloneMeetHtml(roomParam || 'devgeeksnexus-training'), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    // Default: Serve the complete Nexus Suite for Mailbox Owners/Admins
     return new Response(renderWebAppHtml(), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
@@ -1502,7 +1515,7 @@ function renderWebAppHtml(): string {
 
     function copyMeetingLink() {
       if (!currentMeetRoom) return;
-      const link = window.location.origin + '/?meet=' + currentMeetRoom;
+      const link = window.location.origin + '/meet?room=' + encodeURIComponent(currentMeetRoom);
       navigator.clipboard.writeText(link).then(() => {
         const textSpan = document.getElementById('copy-link-text');
         if (textSpan) {
@@ -1510,13 +1523,13 @@ function renderWebAppHtml(): string {
           textSpan.textContent = 'Copied!';
           setTimeout(() => { textSpan.textContent = original; }, 2000);
         }
-        alert('Meeting link copied to clipboard:\\n' + link);
+        alert('Guest meeting link copied to clipboard:\\n' + link + '\\n\\nNote: Guests will only see the meeting and have zero access to your emails.');
       });
     }
 
     function inviteByEmail() {
       if (!currentMeetRoom) return;
-      const link = window.location.origin + '/?meet=' + currentMeetRoom;
+      const link = window.location.origin + '/meet?room=' + encodeURIComponent(currentMeetRoom);
       openCompose();
       document.getElementById('compose-subject').value = 'Invitation: DevGeeksNexus Live Video Training Session';
       document.getElementById('compose-body').value = 
@@ -1831,6 +1844,210 @@ function renderWebAppHtml(): string {
     setInterval(() => {
       if (!currentMeetRoom) loadMessages();
     }, 15000);
+  </script>
+</body>
+</html>`;
+}
+
+function renderStandaloneMeetHtml(initialRoom: string): string {
+  const safeRoom = (initialRoom || 'devgeeksnexus-training').replace(/[^a-zA-Z0-9_-]/g, '');
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>DevGeeksNexus Live Meeting & Training</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <!-- Jitsi Meet WebRTC Video & Screen Share Engine -->
+  <script src="https://meet.jit.si/external_api.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    body { font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; }
+    iframe { border: none !important; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
+
+  <!-- Top Navigation Header -->
+  <header class="h-16 bg-slate-900/90 backdrop-blur border-b border-slate-800/80 px-4 md:px-8 flex items-center justify-between z-20">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-sky-400 flex items-center justify-center text-white shadow-lg shadow-indigo-500/25 ring-1 ring-white/20">
+        <i class="fa-solid fa-video text-base"></i>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="font-bold text-base md:text-lg tracking-tight text-white">DevGeeksNexus</span>
+          <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            LIVE
+          </span>
+        </div>
+        <p class="text-[11px] text-slate-400 hidden sm:block">Video Training & Real-time Collaboration</p>
+      </div>
+    </div>
+
+    <!-- Room Indicator & Actions -->
+    <div class="flex items-center gap-2 sm:gap-3">
+      <div class="hidden md:flex items-center gap-2 px-3 py-1.5 bg-slate-800/70 rounded-lg border border-slate-700/60 text-xs text-slate-300">
+        <i class="fa-solid fa-hashtag text-indigo-400"></i>
+        <span class="font-mono font-medium">${safeRoom}</span>
+      </div>
+      <button onclick="copyCurrentLink()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm">
+        <i class="fa-solid fa-link text-indigo-400"></i>
+        <span id="copy-text">Share</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main View Area -->
+  <main class="flex-1 flex flex-col relative overflow-hidden bg-slate-950">
+
+    <!-- Pre-join Lobby Card -->
+    <div id="prejoin-lobby" class="flex-1 flex items-center justify-center p-4 md:p-6 z-10">
+      <div class="max-w-md w-full bg-slate-900 border border-slate-800/90 rounded-2xl shadow-2xl p-6 md:p-8 relative">
+        <div class="text-center mb-6">
+          <div class="w-16 h-16 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 flex items-center justify-center text-2xl mx-auto mb-4">
+            <i class="fa-solid fa-handshake-angle"></i>
+          </div>
+          <h2 class="text-2xl font-bold text-white tracking-tight">Join Training Session</h2>
+          <p class="text-xs text-slate-400 mt-1">High-definition audio, video, chat & screen sharing.</p>
+        </div>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-slate-300 mb-1.5 uppercase tracking-wider">Your Name or Alias</label>
+            <div class="relative">
+              <span class="absolute inset-y-0 left-0 flex items-center pl-3.5 text-slate-500 pointer-events-none">
+                <i class="fa-solid fa-user text-sm"></i>
+              </span>
+              <input type="text" id="guest-name" placeholder="e.g. John Doe / Trainee" autofocus
+                class="w-full pl-10 pr-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all">
+            </div>
+          </div>
+
+          <div class="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs text-slate-400 space-y-1.5">
+            <div class="flex items-center gap-2 text-indigo-300 font-semibold">
+              <i class="fa-solid fa-shield-halved"></i>
+              <span>Secure Guest Session</span>
+            </div>
+            <p>You are entering this meeting as an authorized attendee. No sign-up or downloads required.</p>
+          </div>
+
+          <button onclick="startMeeting()" id="btn-enter-room"
+            class="w-full py-3 px-4 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-semibold rounded-xl shadow-lg shadow-indigo-600/30 transition-all flex items-center justify-center gap-2">
+            <i class="fa-solid fa-arrow-right-to-bracket"></i>
+            <span>Join Meeting Now</span>
+          </button>
+        </div>
+
+        <div class="mt-6 pt-4 border-t border-slate-800/80 text-center">
+          <p class="text-[11px] text-slate-500">Powered by DevGeeksNexus WebRTC Video Hub</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Active Conference Fullscreen Stage -->
+    <div id="meet-stage" class="hidden flex-1 w-full h-full relative bg-slate-950">
+      <div id="standalone-jitsi-container" class="w-full h-full"></div>
+    </div>
+
+    <!-- Leave Call Screen -->
+    <div id="leave-screen" class="hidden flex-1 flex items-center justify-center p-4 z-10">
+      <div class="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-8 text-center">
+        <div class="w-16 h-16 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center text-2xl mx-auto mb-4">
+          <i class="fa-solid fa-circle-check"></i>
+        </div>
+        <h3 class="text-xl font-bold text-white">You have left the meeting</h3>
+        <p class="text-sm text-slate-400 mt-2 mb-6">Thank you for participating in this DevGeeksNexus training session.</p>
+        <button onclick="rejoinMeeting()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-semibold text-sm transition-colors shadow-md">
+          <i class="fa-solid fa-rotate-right mr-1.5"></i> Rejoin Meeting
+        </button>
+      </div>
+    </div>
+
+  </main>
+
+  <script>
+    const roomName = "${safeRoom}";
+    let jitsiApi = null;
+    let participantName = "";
+
+    // Support enter key on input
+    document.getElementById('guest-name').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startMeeting();
+    });
+
+    function startMeeting() {
+      const input = document.getElementById('guest-name');
+      participantName = (input.value || '').trim() || 'Attendee ' + Math.floor(100 + Math.random() * 900);
+
+      document.getElementById('prejoin-lobby').classList.add('hidden');
+      document.getElementById('leave-screen').classList.add('hidden');
+      document.getElementById('meet-stage').classList.remove('hidden');
+
+      const container = document.getElementById('standalone-jitsi-container');
+      container.innerHTML = '';
+
+      const domain = 'meet.jit.si';
+      const options = {
+        roomName: roomName,
+        width: '100%',
+        height: '100%',
+        parentNode: container,
+        userInfo: {
+          displayName: participantName,
+        },
+        configOverwrite: {
+          startWithAudioMuted: false,
+          startWithVideoMuted: false,
+          prejoinPageEnabled: false,
+          disableDeepLinking: true
+        },
+        interfaceConfigOverwrite: {
+          SHOW_JITSI_WATERMARK: false,
+          SHOW_WATERMARK_FOR_GUESTS: false,
+          TOOLBAR_BUTTONS: [
+            'microphone', 'camera', 'desktop', 'chat', 'raisehand',
+            'tileview', 'fullscreen', 'settings', 'hangup', 'videoquality',
+            'participants-pane', 'recording'
+          ],
+        }
+      };
+
+      try {
+        jitsiApi = new JitsiMeetExternalAPI(domain, options);
+        jitsiApi.addEventListener('videoConferenceLeft', () => {
+          onCallEnded();
+        });
+      } catch (err) {
+        console.error('Conference init error:', err);
+        container.innerHTML = '<div class="p-8 text-center text-rose-400"><p>Unable to load meeting stream.</p></div>';
+      }
+    }
+
+    function onCallEnded() {
+      if (jitsiApi) {
+        try { jitsiApi.dispose(); } catch (e) {}
+        jitsiApi = null;
+      }
+      document.getElementById('meet-stage').classList.add('hidden');
+      document.getElementById('leave-screen').classList.remove('hidden');
+    }
+
+    function rejoinMeeting() {
+      startMeeting();
+    }
+
+    function copyCurrentLink() {
+      const url = window.location.href;
+      navigator.clipboard.writeText(url).then(() => {
+        const text = document.getElementById('copy-text');
+        const orig = text.textContent;
+        text.textContent = 'Copied!';
+        setTimeout(() => { text.textContent = orig; }, 2000);
+      });
+    }
   </script>
 </body>
 </html>`;
