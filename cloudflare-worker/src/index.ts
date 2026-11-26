@@ -1,7 +1,8 @@
 import PostalMime from 'postal-mime';
 
 export interface Env {
-  RESEND_API_KEY: string;
+  RESEND_API_KEY?: string;
+  SMTP_PASS?: string;
   EMAILS: any; // KVNamespace
 }
 
@@ -237,7 +238,14 @@ export default {
         }
 
         // Call Resend REST API
-        const apiKey = env.RESEND_API_KEY;
+        const apiKey = env.RESEND_API_KEY || env.SMTP_PASS;
+        if (!apiKey) {
+          return new Response(JSON.stringify({ error: 'Resend API key is not configured in worker environment.' }), {
+            status: 500,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
         const resendRes = await fetch('https://api.resend.com/emails', {
           method: 'POST',
           headers: {
