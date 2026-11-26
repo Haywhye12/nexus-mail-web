@@ -121,6 +121,217 @@ export default {
 
     const url = new URL(request.url);
 
+    // Standalone Isolated Video Meeting / Training Room Route
+    // Accessible via /meet, /meet?room=..., /meet/:room, or legacy /?meet=...
+    // Fully isolated from email: participants have ZERO access to emails or mailbox APIs
+    if (url.pathname.startsWith('/meet') || url.searchParams.has('meet')) {
+      const roomParam =
+        url.searchParams.get('room') ||
+        url.searchParams.get('meet') ||
+        url.pathname.replace(/^\/meet\/?/, '').trim();
+      return new Response(renderStandaloneMeetHtml(roomParam || 'devgeeksnexus-training'), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
+    // Helper: Parse cookie header
+    const cookieHeader = request.headers.get('Cookie') || '';
+    const cookies = Object.fromEntries(
+      cookieHeader.split(';').map(c => {
+        const [k, ...v] = c.trim().split('=');
+        return [k, decodeURIComponent(v.join('='))];
+      })
+    );
+    const sessionToken = cookies['nexus_session'];
+    let isAuthenticated = false;
+    let authEmail = '';
+
+    if (sessionToken && env.EMAILS) {
+      const sessionData = await env.EMAILS.get(`session:${sessionToken}`, 'json') as any;
+      if (sessionData && sessionData.email) {
+        isAuthenticated = true;
+        authEmail = sessionData.email;
+      }
+    }
+
+    // AUTH API: POST /api/auth/send-otp
+    if (request.method === 'POST' && url.pathname === '/api/auth/send-otp') {
+      try {
+        const body = (await request.json()) as any;
+        const email = (body.email || '').trim().toLowerCase();
+
+        // Default allowed email or organization emails
+        const isAuthorized =
+          email === 'ayomidebobani@gmail.com' ||
+          email.endsWith('@devgeeksnexus.com');
+
+        if (!email || !isAuthorized) {
+          return new Response(
+            JSON.stringify({ error: 'Unauthorized email address. Only admin and authorized personnel are permitted.' }),
+            { status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        // Generate a 6-digit OTP
+        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+        if (env.EMAILS) {
+          // Store OTP in Cloudflare KV with 10-minute expiration (600 seconds)
+          await env.EMAILS.put(`otp:${email}`, JSON.stringify({ code: otpCode, timestamp: Date.now() }), {
+            expirationTtl: 600,
+          });
+        }
+
+        // Send OTP directly via Resend to the user's destination email
+        const resendKey = (env.RESEND_API_KEY || (env as any).SMTP_PASS || '').trim();
+        if (resendKey) {
+          const resendResponse = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${resendKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              from: 'DevGeeksNexus Security <info@devgeeksnexus.com>',
+              to: [email],
+              subject: `${otpCode} is your DevGeeksNexus Webmail Login Code`,
+              html: `
+                <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 32px 24px; background: #0f172a; border-radius: 16px; color: #f8fafc; border: 1px solid #1e293b;">
+                  <div style="text-align: center; margin-bottom: 24px;">
+                    <div style="display: inline-block; width: 48px; height: 48px; line-height: 48px; border-radius: 12px; background: linear-gradient(135deg, #4f46e5, #0ea5e9); color: #ffffff; font-weight: bold; font-size: 22px;">N</div>
+                    <h2 style="font-size: 20px; font-weight: 700; color: #ffffff; margin-top: 12px; margin-bottom: 4px;">DevGeeksNexus Webmail</h2>
+                    <p style="font-size: 13px; color: #94a3b8; margin: 0;">Identity Verification & Secure Sign-In</p>
+                  </div>
+                  <div style="background: #1e293b; border-radius: 12px; padding: 24px; text-align: center; border: 1px solid #334155;">
+                    <p style="font-size: 14px; color: #cbd5e1; margin-top: 0; margin-bottom: 16px;">Here is your single-use verification code to log in to your mailbox:</p>
+                    <div style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #38bdf8; font-family: monospace; padding: 12px 0;">${otpCode}</div>
+                    <p style="font-size: 12px; color: #94a3b8; margin-top: 16px; margin-bottom: 0;">This code expires in <strong>10 minutes</strong>. Never share this code with anyone.</p>
+                  </div>
+                  <div style="margin-top: 24px; text-align: center; font-size: 11px; color: #64748b;">
+                    <p style="margin: 0;">If you did not request this login code, you can safely ignore this email.</p>
+                  </div>
+                </div>
+              `,
+              text: `Your DevGeeksNexus verification code is: ${otpCode}. It expires in 10 minutes.`,
+            }),
+          });
+
+          if (!resendResponse.ok) {
+            const errBody = await resendResponse.text();
+            console.error('Failed to send OTP via Resend:', errBody);
+            return new Response(JSON.stringify({ error: 'Failed to send OTP email. Please try again.' }), {
+              status: 500,
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+        } else {
+          console.warn('RESEND_API_KEY missing, unable to send OTP email.');
+        }
+
+        return new Response(
+          JSON.stringify({ success: true, message: `OTP verification code sent to ${email}` }),
+          { headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message || 'Error sending OTP' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // AUTH API: POST /api/auth/verify-otp
+    if (request.method === 'POST' && url.pathname === '/api/auth/verify-otp') {
+      try {
+        const body = (await request.json()) as any;
+        const email = (body.email || '').trim().toLowerCase();
+        const code = (body.code || '').trim();
+
+        if (!email || !code) {
+          return new Response(JSON.stringify({ error: 'Email and verification code are required.' }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        if (!env.EMAILS) {
+          return new Response(JSON.stringify({ error: 'Storage KV unavailable.' }), {
+            status: 500,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const storedOtp = await env.EMAILS.get(`otp:${email}`, 'json') as any;
+
+        if (!storedOtp || storedOtp.code !== code) {
+          return new Response(JSON.stringify({ error: 'Invalid or expired verification code. Please request a new code.' }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        // OTP is valid! Delete used OTP
+        await env.EMAILS.delete(`otp:${email}`);
+
+        // Generate 30-day session token
+        const newSessionToken = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+        const sessionPayload = {
+          email,
+          createdAt: Date.now(),
+        };
+
+        // 30 days = 2592000 seconds
+        await env.EMAILS.put(`session:${newSessionToken}`, JSON.stringify(sessionPayload), {
+          expirationTtl: 2592000,
+        });
+
+        const setCookieHeader = `nexus_session=${newSessionToken}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax; Secure`;
+
+        return new Response(JSON.stringify({ success: true, email }), {
+          headers: {
+            ...CORS_HEADERS,
+            'Content-Type': 'application/json',
+            'Set-Cookie': setCookieHeader,
+          },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message || 'Verification failed.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // AUTH API: POST /api/auth/logout
+    if (request.method === 'POST' && url.pathname === '/api/auth/logout') {
+      if (sessionToken && env.EMAILS) {
+        await env.EMAILS.delete(`session:${sessionToken}`);
+      }
+      return new Response(JSON.stringify({ success: true }), {
+        headers: {
+          ...CORS_HEADERS,
+          'Content-Type': 'application/json',
+          'Set-Cookie': 'nexus_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure',
+        },
+      });
+    }
+
+    // Check Authentication for Mail APIs and Main App
+    if (!isAuthenticated) {
+      // If client requests API while unauthenticated
+      if (url.pathname.startsWith('/api/')) {
+        return new Response(JSON.stringify({ error: 'Authentication required. Please log in.' }), {
+          status: 401,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // Serve Login / OTP Page
+      return new Response(renderLoginHtml('ayomidebobani@gmail.com'), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+
     // API: GET /api/messages
     if (url.pathname === '/api/messages') {
       const folder = url.searchParams.get('folder') || 'inbox';
@@ -419,27 +630,14 @@ export default {
       }
     }
 
-    // Standalone Isolated Video Meeting / Training Room Route
-    // Accessible via /meet, /meet?room=..., /meet/:room, or legacy /?meet=...
-    // Fully isolated from email: participants have ZERO access to emails or mailbox APIs
-    if (url.pathname.startsWith('/meet') || url.searchParams.has('meet')) {
-      const roomParam =
-        url.searchParams.get('room') ||
-        url.searchParams.get('meet') ||
-        url.pathname.replace(/^\/meet\/?/, '').trim();
-      return new Response(renderStandaloneMeetHtml(roomParam || 'devgeeksnexus-training'), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      });
-    }
-
-    // Default: Serve the complete Nexus Suite for Mailbox Owners/Admins
-    return new Response(renderWebAppHtml(), {
+    // Default: Serve the complete Nexus Suite for Authenticated User
+    return new Response(renderWebAppHtml(authEmail), {
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
   },
 };
 
-function renderWebAppHtml(): string {
+function renderWebAppHtml(currentUserEmail?: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -640,15 +838,30 @@ function renderWebAppHtml(): string {
         </div>
         <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
       </button>
+
+      <div class="pt-2 pb-1 px-3">
+        <div class="border-t border-slate-800"></div>
+      </div>
+
+      <!-- Logout Button -->
+      <button onclick="handleLogout()" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-rose-400 hover:bg-rose-950/40 hover:text-rose-300 transition-colors">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid fa-arrow-right-from-bracket w-4"></i>
+          <span>Sign Out</span>
+        </div>
+        <i class="fa-solid fa-lock text-xs text-slate-500"></i>
+      </button>
     </nav>
 
-    <!-- Footer Status -->
-    <div class="p-3 border-t border-slate-800 text-xs text-slate-400 flex items-center justify-between">
-      <div class="flex items-center space-x-1.5">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span class="text-[11px] text-slate-300">Cloudflare 24/7 Live</span>
+    <!-- Footer Status & User Info -->
+    <div class="p-3 border-t border-slate-800 text-xs text-slate-400 space-y-1.5">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center space-x-1.5 truncate">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span class="text-[11px] text-slate-300 font-mono truncate">${currentUserEmail || 'Authenticated'}</span>
+        </div>
+        <span class="px-1.5 py-0.5 rounded text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800/50 font-mono">2FA Active</span>
       </div>
-      <span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300 font-mono">KV Storage</span>
     </div>
   </aside>
 
@@ -2019,6 +2232,15 @@ function renderWebAppHtml(): string {
       return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
+    async function handleLogout() {
+      if (confirm('Are you sure you want to log out of DevGeeksNexus Webmail?')) {
+        try {
+          await fetch('/api/auth/logout', { method: 'POST' });
+        } catch (e) {}
+        window.location.reload();
+      }
+    }
+
     // Auto-adapt layout on resize
     window.addEventListener('resize', () => {
       const listSec = document.getElementById('email-list-section');
@@ -2461,6 +2683,240 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
       }, 1000);
 
       alert('Recording completed and downloaded to your device!\\n\\nSaved file: ' + filename + '\\n\\nReady to be uploaded to YouTube.');
+    }
+  </script>
+</body>
+</html>`;
+}
+
+function renderLoginHtml(defaultEmail: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Sign In | DevGeeksNexus Webmail</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    body { font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; }
+    .otp-input::-webkit-outer-spin-button,
+    .otp-input::-webkit-inner-spin-button {
+      -webkit-appearance: none;
+      margin: 0;
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4 antialiased selection:bg-indigo-500 selection:text-white relative overflow-hidden">
+
+  <!-- Ambient Background Glows -->
+  <div class="absolute -top-32 -left-32 w-96 h-96 bg-indigo-600/15 rounded-full blur-3xl pointer-events-none"></div>
+  <div class="absolute -bottom-32 -right-32 w-96 h-96 bg-sky-500/15 rounded-full blur-3xl pointer-events-none"></div>
+
+  <div class="w-full max-w-md bg-slate-900/90 border border-slate-800/90 backdrop-blur-xl rounded-3xl p-6 sm:p-8 shadow-2xl relative z-10">
+    
+    <!-- Branding Header -->
+    <div class="text-center mb-8">
+      <div class="w-16 h-16 rounded-2xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-sky-400 flex items-center justify-center text-white text-2xl font-black shadow-lg shadow-indigo-500/30 mx-auto mb-4 ring-1 ring-white/20">
+        N
+      </div>
+      <h1 class="text-2xl font-bold text-white tracking-tight">DevGeeksNexus Webmail</h1>
+      <p class="text-xs text-slate-400 mt-1.5">Enterprise Cloudflare Email & Video Hub</p>
+    </div>
+
+    <!-- STEP 1: Enter Email & Request OTP -->
+    <div id="step-email" class="space-y-5">
+      <div>
+        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Admin Email Address</label>
+        <div class="relative">
+          <span class="absolute inset-y-0 left-0 flex items-center pl-3.5 text-slate-500 pointer-events-none">
+            <i class="fa-solid fa-envelope text-sm"></i>
+          </span>
+          <input type="email" id="auth-email" value="${defaultEmail}" required
+            placeholder="name@domain.com"
+            class="w-full pl-10 pr-3.5 py-3 bg-slate-950 border border-slate-800 rounded-xl text-white text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all font-mono" />
+        </div>
+        <p class="text-[11px] text-slate-500 mt-1.5 flex items-center gap-1.5">
+          <i class="fa-solid fa-shield-halved text-emerald-400"></i>
+          <span>Default authorized administrator account prefilled</span>
+        </p>
+      </div>
+
+      <div id="email-error-msg" class="hidden p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center gap-2">
+        <i class="fa-solid fa-circle-exclamation flex-shrink-0"></i>
+        <span id="email-error-text"></span>
+      </div>
+
+      <button onclick="handleSendOtp()" id="btn-send-otp"
+        class="w-full py-3.5 px-4 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-semibold rounded-xl shadow-lg shadow-indigo-600/30 active:scale-[0.99] transition-all flex items-center justify-center gap-2">
+        <i class="fa-solid fa-paper-plane text-xs"></i>
+        <span id="btn-send-text">Send Verification Code</span>
+      </button>
+
+      <div class="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80 text-[11px] text-slate-400 flex items-start gap-2.5">
+        <i class="fa-solid fa-key text-indigo-400 mt-0.5"></i>
+        <span>A 6-digit one-time password (OTP) will be generated and emailed securely to this address.</span>
+      </div>
+    </div>
+
+    <!-- STEP 2: Enter 6-digit OTP Code -->
+    <div id="step-otp" class="hidden space-y-5">
+      <div class="text-center">
+        <div class="w-12 h-12 rounded-xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center text-xl mx-auto mb-2 border border-indigo-500/20">
+          <i class="fa-solid fa-lock"></i>
+        </div>
+        <h3 class="text-lg font-bold text-white">Enter Verification Code</h3>
+        <p class="text-xs text-slate-400 mt-1">We sent a 6-digit code to <br/><span id="target-email-display" class="font-mono text-indigo-300 font-semibold"></span></p>
+      </div>
+
+      <div>
+        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 text-center">6-Digit Code</label>
+        <div class="relative">
+          <input type="text" id="auth-code" maxlength="6" inputmode="numeric" placeholder="123456" autofocus
+            class="w-full text-center tracking-[12px] text-2xl font-mono font-bold py-3.5 bg-slate-950 border border-slate-800 rounded-xl text-sky-400 placeholder-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all" />
+        </div>
+      </div>
+
+      <div id="otp-error-msg" class="hidden p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center gap-2">
+        <i class="fa-solid fa-circle-exclamation flex-shrink-0"></i>
+        <span id="otp-error-text"></span>
+      </div>
+
+      <button onclick="handleVerifyOtp()" id="btn-verify-otp"
+        class="w-full py-3.5 px-4 bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white font-semibold rounded-xl shadow-lg shadow-emerald-600/30 active:scale-[0.99] transition-all flex items-center justify-center gap-2">
+        <i class="fa-solid fa-shield-check text-xs"></i>
+        <span id="btn-verify-text">Verify & Access Webmail</span>
+      </button>
+
+      <div class="flex items-center justify-between text-xs pt-2">
+        <button onclick="backToEmailStep()" class="text-slate-400 hover:text-white transition-colors flex items-center gap-1.5">
+          <i class="fa-solid fa-arrow-left text-[10px]"></i> Change email
+        </button>
+        <button onclick="handleSendOtp()" id="btn-resend-otp" class="text-indigo-400 hover:text-indigo-300 transition-colors font-medium">
+          Resend code
+        </button>
+      </div>
+    </div>
+
+    <!-- Security Footnote -->
+    <div class="mt-8 pt-4 border-t border-slate-800/80 text-center">
+      <p class="text-[11px] text-slate-500 flex items-center justify-center gap-1.5">
+        <i class="fa-solid fa-shield-halved text-emerald-500/80"></i>
+        <span>Secured by Cloudflare Workers & Resend 2FA</span>
+      </p>
+    </div>
+
+  </div>
+
+  <script>
+    let pendingEmail = "";
+
+    // Allow Enter key to trigger submit
+    document.getElementById('auth-email').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') handleSendOtp();
+    });
+    document.getElementById('auth-code').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') handleVerifyOtp();
+    });
+
+    async function handleSendOtp() {
+      const emailInput = document.getElementById('auth-email');
+      const email = (emailInput.value || '').trim();
+      const errBox = document.getElementById('email-error-msg');
+      const errText = document.getElementById('email-error-text');
+      const btn = document.getElementById('btn-send-otp');
+      const btnText = document.getElementById('btn-send-text');
+
+      errBox.classList.add('hidden');
+
+      if (!email) {
+        errText.textContent = 'Please enter your email address.';
+        errBox.classList.remove('hidden');
+        return;
+      }
+
+      btn.disabled = true;
+      btnText.textContent = 'Sending OTP code...';
+
+      try {
+        const res = await fetch('/api/auth/send-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.success) {
+          pendingEmail = email;
+          document.getElementById('target-email-display').textContent = email;
+          document.getElementById('step-email').classList.add('hidden');
+          document.getElementById('step-otp').classList.remove('hidden');
+          document.getElementById('auth-code').value = '';
+          document.getElementById('auth-code').focus();
+        } else {
+          errText.textContent = data.error || 'Failed to send OTP code.';
+          errBox.classList.remove('hidden');
+        }
+      } catch (err) {
+        errText.textContent = 'Network error while contacting authentication service.';
+        errBox.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btnText.textContent = 'Send Verification Code';
+      }
+    }
+
+    async function handleVerifyOtp() {
+      const codeInput = document.getElementById('auth-code');
+      const code = (codeInput.value || '').trim();
+      const errBox = document.getElementById('otp-error-msg');
+      const errText = document.getElementById('otp-error-text');
+      const btn = document.getElementById('btn-verify-otp');
+      const btnText = document.getElementById('btn-verify-text');
+
+      errBox.classList.add('hidden');
+
+      if (!code || code.length < 4) {
+        errText.textContent = 'Please enter the 6-digit verification code.';
+        errBox.classList.remove('hidden');
+        return;
+      }
+
+      btn.disabled = true;
+      btnText.textContent = 'Verifying code...';
+
+      try {
+        const res = await fetch('/api/auth/verify-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: pendingEmail, code })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.success) {
+          btnText.textContent = 'Access Granted! Redirecting...';
+          setTimeout(() => {
+            window.location.reload();
+          }, 600);
+        } else {
+          errText.textContent = data.error || 'Invalid or expired code.';
+          errBox.classList.remove('hidden');
+          btn.disabled = false;
+          btnText.textContent = 'Verify & Access Webmail';
+        }
+      } catch (err) {
+        errText.textContent = 'Network error during verification.';
+        errBox.classList.remove('hidden');
+        btn.disabled = false;
+        btnText.textContent = 'Verify & Access Webmail';
+      }
+    }
+
+    function backToEmailStep() {
+      document.getElementById('step-otp').classList.add('hidden');
+      document.getElementById('step-email').classList.remove('hidden');
+      document.getElementById('auth-email').focus();
     }
   </script>
 </body>
