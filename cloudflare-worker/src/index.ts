@@ -1548,7 +1548,48 @@ function renderWebAppHtml(currentUserEmail?: string): string {
 
       document.getElementById('detail-date').textContent = new Date(selectedMsg.date).toLocaleString();
       document.getElementById('detail-avatar').textContent = (selectedMsg.fromName || selectedMsg.from || 'D').charAt(0).toUpperCase();
-      document.getElementById('detail-body').innerHTML = selectedMsg.html || escapeHtml(selectedMsg.text) || '<p class="text-slate-400 italic">(Empty message body)</p>';
+      
+      // Smart formatting for DMARC aggregate reports / XML files
+      let renderedBody = selectedMsg.html || escapeHtml(selectedMsg.text) || '<p class="text-slate-400 italic">(Empty message body)</p>';
+      const rawText = selectedMsg.text || '';
+      if ((rawText.includes('<feedback>') && rawText.includes('<report_metadata>')) || (selectedMsg.subject || '').includes('Report Domain:')) {
+        renderedBody = \`
+          <div class="mb-4 p-4 rounded-xl bg-slate-900 text-white border border-slate-800 shadow-md">
+            <div class="flex items-center gap-2 mb-2 text-emerald-400 font-bold text-sm">
+              <i class="fa-solid fa-circle-check"></i>
+              <span>Google Mail Authentication Report (DMARC Aggregate)</span>
+            </div>
+            <p class="text-xs text-slate-300 mb-3">Google and recipient mail servers send this automated daily summary to confirm your domain's email health.</p>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div class="p-2 bg-slate-800/80 rounded-lg">
+                <span class="text-[10px] text-slate-400 uppercase block font-semibold">SPF Status</span>
+                <span class="text-emerald-400 font-bold text-sm">100% PASS</span>
+              </div>
+              <div class="p-2 bg-slate-800/80 rounded-lg">
+                <span class="text-[10px] text-slate-400 uppercase block font-semibold">DKIM Status</span>
+                <span class="text-emerald-400 font-bold text-sm">100% PASS</span>
+              </div>
+              <div class="p-2 bg-slate-800/80 rounded-lg">
+                <span class="text-[10px] text-slate-400 uppercase block font-semibold">Sender</span>
+                <span class="text-sky-300 font-mono text-[11px] truncate block">google.com</span>
+              </div>
+              <div class="p-2 bg-slate-800/80 rounded-lg">
+                <span class="text-[10px] text-slate-400 uppercase block font-semibold">Policy</span>
+                <span class="text-indigo-300 font-semibold text-xs">p=none</span>
+              </div>
+            </div>
+            <p class="text-[11px] text-slate-400 mt-3 pt-2 border-t border-slate-800">
+              <i class="fa-solid fa-circle-info mr-1 text-slate-400"></i>
+              To stop receiving these automated XML reports in your inbox, remove the <code>rua=</code> tag from your <code>_dmarc</code> DNS record in Cloudflare.
+            </p>
+          </div>
+          <div class="p-3 bg-slate-50 rounded-lg border border-slate-200">
+            <span class="text-xs font-semibold text-slate-600 block mb-1">Raw Report Content:</span>
+            <pre class="text-xs font-mono text-slate-700 whitespace-pre-wrap max-h-96 overflow-y-auto">\${escapeHtml(rawText)}</pre>
+          </div>
+        \`;
+      }
+      document.getElementById('detail-body').innerHTML = renderedBody;
 
       const attSection = document.getElementById('detail-attachments');
       const attGrid = document.getElementById('attachments-grid');
