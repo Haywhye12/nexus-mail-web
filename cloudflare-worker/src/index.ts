@@ -4,7 +4,58 @@ export interface Env {
   RESEND_API_KEY?: string;
   SMTP_PASS?: string;
   GEMINI_API_KEY?: string;
-  EMAILS: any; // KVNamespace
+  EMAILS?: any; // KVNamespace
+  DB?: D1Database;
+}
+
+// User Accounts & Role Permissions
+// Role 'admin': Full access to all accounts (admin@, info@, ayomidebobani@), Spam settings, and Security.
+// Role 'member': Restricted strictly to assigned mailboxes (e.g. info@ or personal only, NO access to admin@).
+export interface TeamMember {
+  email: string;
+  name: string;
+  role: 'superadmin' | 'admin' | 'member';
+  allowedAccounts: string[]; // ['*'] for all, or specific email addresses
+}
+
+export const TEAM_MEMBERS: TeamMember[] = [
+  {
+    email: 'ayomidebobani@gmail.com',
+    name: 'Ayomide Bobani',
+    role: 'superadmin',
+    allowedAccounts: ['*'],
+  },
+  {
+    email: 'ayomidebobani@devgeeksnexus.com',
+    name: 'Ayomide Bobani (Direct)',
+    role: 'admin',
+    allowedAccounts: ['*'],
+  },
+  {
+    email: 'admin@devgeeksnexus.com',
+    name: 'Admin Desk',
+    role: 'admin',
+    allowedAccounts: ['*'],
+  },
+  {
+    email: 'info@devgeeksnexus.com',
+    name: 'Support Team',
+    role: 'member',
+    allowedAccounts: ['info@devgeeksnexus.com'],
+  },
+];
+
+export function resolveUserPermissions(userEmail: string): TeamMember {
+  const normalized = (userEmail || '').trim().toLowerCase();
+  const matched = TEAM_MEMBERS.find((m) => m.email.toLowerCase() === normalized);
+  if (matched) return matched;
+  // Default fallback for any newly verified @devgeeksnexus.com staff: member with access to info only
+  return {
+    email: normalized,
+    name: normalized.split('@')[0],
+    role: 'member',
+    allowedAccounts: ['info@devgeeksnexus.com'],
+  };
 }
 
 export const KNOWN_ACCOUNTS = [
@@ -63,6 +114,116 @@ function resolveAccount(toStr: string, defaultAcc: string = 'info@devgeeksnexus.
   return defaultAcc;
 }
 
+function rowToMessage(row: any): any {
+  if (!row) return null;
+  let attachments = [];
+  try {
+    if (row.attachments_json) attachments = JSON.parse(row.attachments_json);
+  } catch (e) {}
+  return {
+    id: row.id,
+    account: row.account,
+    from: row.from_address,
+    fromName: row.from_name || row.from_address,
+    to: row.to_address,
+    cc: row.cc || '',
+    bcc: row.bcc || '',
+    subject: row.subject || '(No Subject)',
+    text: row.text || '',
+    html: row.html || (row.text ? `<pre>${row.text}</pre>` : ''),
+    date: row.date,
+    messageId: row.message_id || `<${row.id}@devgeeksnexus.com>`,
+    folder: row.folder || 'inbox',
+    isRead: Boolean(row.is_read),
+    isStarred: Boolean(row.is_starred),
+    isSpam: Boolean(row.is_spam),
+    spamReason: row.spam_reason || null,
+    attachments,
+    trackingId: row.tracking_id || null,
+    isScheduled: Boolean(row.is_scheduled),
+    scheduledTime: row.scheduled_time || null,
+  };
+}
+
+async function saveMessageToDB(db: D1Database, msg: any) {
+  const attachmentsJson = JSON.stringify(msg.attachments || []);
+  await db.prepare(`
+    INSERT OR REPLACE INTO messages (
+      id, account, from_address, from_name, to_address, cc, bcc,
+      subject, text, html, date, message_id, folder,
+      is_read, is_starred, is_spam, spam_reason, attachments_json,
+      tracking_id, is_scheduled, scheduled_time, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    msg.id,
+    msg.account,
+    msg.from || '',
+    msg.fromName || '',
+    msg.to || '',
+    msg.cc || '',
+    msg.bcc || '',
+    msg.subject || '',
+    msg.text || '',
+    msg.html || '',
+    msg.date || new Date().toISOString(),
+    msg.messageId || null,
+    msg.folder || 'inbox',
+    msg.isRead ? 1 : 0,
+    msg.isStarred ? 1 : 0,
+    msg.isSpam ? 1 : 0,
+    msg.spamReason || null,
+    attachmentsJson,
+    msg.trackingId || null,
+    msg.isScheduled ? 1 : 0,
+    msg.scheduledTime || null,
+    Date.now()
+  ).run();
+}
+
+async function saveMessageToKV(kv: any, msg: any) {
+  // Direct O(1) write with deterministic key
+  const key = `msg:${msg.id}`;
+  await kv.put(key, JSON.stringify(msg));
+  try {
+    const index: string[] = (await kv.get('index:messages', 'json')) || [];
+    if (!index.includes(key) && !index.includes(msg.id)) {
+      index.unshift(key);
+      if (index.length > 500) index.length = 500;
+      await kv.put('index:messages', JSON.stringify(index));
+    }
+  } catch (e) {}
+}
+
+async function deleteMessageFromKV(kv: any, msgId: string) {
+  // Direct O(1) delete
+  await kv.delete(`msg:${msgId}`);
+  try {
+    const index: string[] = (await kv.get('index:messages', 'json')) || [];
+    const filtered = index.filter((id: string) => id !== msgId && !id.endsWith(msgId));
+    await kv.put('index:messages', JSON.stringify(filtered));
+  } catch (e) {}
+}
+
+async function scheduleMessageInKV(kv: any, schedId: string, schedPayload: any) {
+  await kv.put(`scheduled:${schedId}`, JSON.stringify(schedPayload));
+  try {
+    const index: string[] = (await kv.get('index:scheduled', 'json')) || [];
+    if (!index.includes(schedId)) {
+      index.push(schedId);
+      await kv.put('index:scheduled', JSON.stringify(index));
+    }
+  } catch (e) {}
+}
+
+async function deleteScheduledFromKV(kv: any, schedId: string) {
+  await kv.delete(`scheduled:${schedId}`);
+  try {
+    const index: string[] = (await kv.get('index:scheduled', 'json')) || [];
+    const filtered = index.filter((id: string) => id !== schedId);
+    await kv.put('index:scheduled', JSON.stringify(filtered));
+  } catch (e) {}
+}
+
 export default {
   // 1. INBOUND EMAIL EVENT HANDLER (Cloudflare Email Routing)
   async email(message: any, env: Env, ctx: any): Promise<void> {
@@ -78,6 +239,43 @@ export default {
       const ccAddress = (parsed.cc || []).map((c: any) => c.address || c.name).join(', ');
 
       const targetAccount = resolveAccount(toAddress);
+
+      // SPAM & PHISHING FILTERING ENGINE
+      let isSpam = false;
+      let spamReason = '';
+      if (env.EMAILS) {
+        const securitySettings = (await env.EMAILS.get('settings:security', 'json')) as any || {
+          blocklist: [],
+          allowlist: [],
+          spamKeywords: ['claim prize', 'wire money', 'urgent transfer', 'crypto investment', 'bitcoin bonus', 'verify bank login', 'account suspended click here'],
+        };
+
+        const fromNormalized = fromAddress.toLowerCase();
+        const bodyContent = `${parsed.subject || ''} ${parsed.text || ''}`.toLowerCase();
+
+        // 1. Check Allowlist
+        const isAllowlisted = (securitySettings.allowlist || []).some((item: string) => fromNormalized.includes(item.toLowerCase()));
+
+        if (!isAllowlisted) {
+          // 2. Check Blocklist
+          const isBlocklisted = (securitySettings.blocklist || []).some((item: string) => fromNormalized.includes(item.toLowerCase()));
+          if (isBlocklisted) {
+            isSpam = true;
+            spamReason = 'Sender is on your automated blocklist';
+          }
+
+          // 3. Check Keyword and Phishing patterns
+          if (!isSpam && securitySettings.spamKeywords) {
+            for (const kw of securitySettings.spamKeywords) {
+              if (bodyContent.includes(kw.toLowerCase())) {
+                isSpam = true;
+                spamReason = `Detected phishing/spam pattern: "${kw}"`;
+                break;
+              }
+            }
+          }
+        }
+      }
 
       const attachments = (parsed.attachments || []).map((att: any) => ({
         filename: att.filename || 'attachment',
@@ -100,14 +298,19 @@ export default {
         date: parsed.date || new Date().toISOString(),
         messageId: parsed.messageId || `<${msgId}@devgeeksnexus.com>`,
         attachments,
-        folder: 'inbox',
+        folder: isSpam ? 'spam' : 'inbox',
+        isSpam,
+        spamReason: spamReason || null,
         isRead: false,
         isStarred: false,
       };
 
-      if (env.EMAILS) {
-        await env.EMAILS.put(`msg:${payload.date}:${msgId}`, JSON.stringify(payload));
-        console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare KV.`);
+      if (env.DB) {
+        await saveMessageToDB(env.DB, payload);
+        console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare D1 (folder: ${payload.folder}).`);
+      } else if (env.EMAILS) {
+        await saveMessageToKV(env.EMAILS, payload);
+        console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare KV (folder: ${payload.folder}).`);
       }
     } catch (err: any) {
       console.error('Inbound email error:', err.message || err);
@@ -116,14 +319,21 @@ export default {
 
   // 1.5 SCHEDULED CRON HANDLER (Scheduled Sending)
   async scheduled(event: any, env: Env, ctx: any) {
-    if (!env.EMAILS) return;
     try {
       const now = Date.now();
-      const list = await env.EMAILS.list({ prefix: 'scheduled:' });
-      for (const key of list.keys) {
-        const item = await env.EMAILS.get(key.name, 'json') as any;
-        if (item && item.scheduledTime && item.scheduledTime <= now) {
-          // Send scheduled email via Resend
+      if (env.DB) {
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM scheduled_emails WHERE scheduled_time <= ?'
+        ).bind(now).all();
+
+        for (const row of (results || []) as any[]) {
+          let item: any;
+          try {
+            item = JSON.parse(row.payload_json);
+          } catch (e) {
+            continue;
+          }
+
           const apiKey = env.RESEND_API_KEY || env.SMTP_PASS;
           if (apiKey) {
             const resendPayload: any = {
@@ -151,8 +361,7 @@ export default {
             });
 
             if (sendRes.ok) {
-              const resData = await sendRes.json() as any;
-              // Save to sent folder
+              const resData = (await sendRes.json()) as any;
               const sentId = `sent_${Date.now()}`;
               const sentMsg = {
                 id: sentId,
@@ -173,8 +382,69 @@ export default {
                 messageId: resData.id,
                 trackingId: item.trackingId || null,
               };
-              await env.EMAILS.put(`msg:${sentMsg.date}:${sentId}`, JSON.stringify(sentMsg));
-              await env.EMAILS.delete(key.name);
+              await saveMessageToDB(env.DB, sentMsg);
+              await env.DB.prepare('DELETE FROM scheduled_emails WHERE id = ?').bind(row.id).run();
+              await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(row.id).run();
+            }
+          }
+        }
+      } else if (env.EMAILS) {
+        const schedIndex: string[] = (await env.EMAILS.get('index:scheduled', 'json')) || [];
+        for (const schedId of schedIndex) {
+          const item = (await env.EMAILS.get(`scheduled:${schedId}`, 'json')) as any;
+          if (item && item.scheduledTime && item.scheduledTime <= now) {
+            const apiKey = env.RESEND_API_KEY || env.SMTP_PASS;
+            if (apiKey) {
+              const resendPayload: any = {
+                from: item.fromFormatted || item.from,
+                to: item.toList,
+                subject: item.subject,
+                html: item.htmlWithTracking || item.html || `<p>${item.text}</p>`,
+              };
+              if (item.ccList && item.ccList.length > 0) resendPayload.cc = item.ccList;
+              if (item.bccList && item.bccList.length > 0) resendPayload.bcc = item.bccList;
+              if (item.attachments && item.attachments.length > 0) {
+                resendPayload.attachments = item.attachments.map((att: any) => ({
+                  filename: att.filename,
+                  content: att.contentBase64,
+                }));
+              }
+
+              const sendRes = await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(resendPayload),
+              });
+
+              if (sendRes.ok) {
+                const resData = await sendRes.json() as any;
+                const sentId = `sent_${Date.now()}`;
+                const sentMsg = {
+                  id: sentId,
+                  account: item.from,
+                  from: item.from,
+                  fromName: item.fromName,
+                  to: item.toList.join(', '),
+                  cc: (item.ccList || []).join(', '),
+                  bcc: (item.bccList || []).join(', '),
+                  subject: item.subject,
+                  text: item.text || '',
+                  html: item.html || '',
+                  date: new Date().toISOString(),
+                  folder: 'sent',
+                  isRead: true,
+                  isStarred: false,
+                  attachments: item.attachments || [],
+                  messageId: resData.id,
+                  trackingId: item.trackingId || null,
+                };
+                await saveMessageToKV(env.EMAILS, sentMsg);
+                await deleteScheduledFromKV(env.EMAILS, schedId);
+                await deleteMessageFromKV(env.EMAILS, schedId);
+              }
             }
           }
         }
@@ -195,15 +465,27 @@ export default {
     // API: GET /api/track/open (Tracking pixel)
     if (url.pathname === '/api/track/open') {
       const trackingId = url.searchParams.get('tid');
-      if (trackingId && env.EMAILS) {
+      if (trackingId) {
         ctx.waitUntil(
           (async () => {
-            const existing = await env.EMAILS.get(`track:${trackingId}`, 'json') as any || { opens: 0, clicks: 0, firstOpenedAt: null, lastOpenedAt: null };
-            existing.opens = (existing.opens || 0) + 1;
             const now = new Date().toISOString();
-            if (!existing.firstOpenedAt) existing.firstOpenedAt = now;
-            existing.lastOpenedAt = now;
-            await env.EMAILS.put(`track:${trackingId}`, JSON.stringify(existing));
+            if (env.DB) {
+              await env.DB.prepare(`
+                INSERT INTO tracking (id, opens, clicks, first_opened_at, last_opened_at, updated_at)
+                VALUES (?, 1, 0, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  opens = opens + 1,
+                  first_opened_at = COALESCE(first_opened_at, excluded.first_opened_at),
+                  last_opened_at = excluded.last_opened_at,
+                  updated_at = excluded.updated_at
+              `).bind(trackingId, now, now, now).run();
+            } else if (env.EMAILS) {
+              const existing = await env.EMAILS.get(`track:${trackingId}`, 'json') as any || { opens: 0, clicks: 0, firstOpenedAt: null, lastOpenedAt: null };
+              existing.opens = (existing.opens || 0) + 1;
+              if (!existing.firstOpenedAt) existing.firstOpenedAt = now;
+              existing.lastOpenedAt = now;
+              await env.EMAILS.put(`track:${trackingId}`, JSON.stringify(existing));
+            }
           })()
         );
       }
@@ -229,15 +511,27 @@ export default {
     if (url.pathname === '/api/track/click') {
       const trackingId = url.searchParams.get('tid');
       const targetUrl = url.searchParams.get('url');
-      if (trackingId && env.EMAILS) {
+      if (trackingId) {
         ctx.waitUntil(
           (async () => {
-            const existing = await env.EMAILS.get(`track:${trackingId}`, 'json') as any || { opens: 0, clicks: 0, firstClickedAt: null, lastClickedAt: null };
-            existing.clicks = (existing.clicks || 0) + 1;
             const now = new Date().toISOString();
-            if (!existing.firstClickedAt) existing.firstClickedAt = now;
-            existing.lastClickedAt = now;
-            await env.EMAILS.put(`track:${trackingId}`, JSON.stringify(existing));
+            if (env.DB) {
+              await env.DB.prepare(`
+                INSERT INTO tracking (id, opens, clicks, first_clicked_at, last_clicked_at, updated_at)
+                VALUES (?, 0, 1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  clicks = clicks + 1,
+                  first_clicked_at = COALESCE(first_clicked_at, excluded.first_clicked_at),
+                  last_clicked_at = excluded.last_clicked_at,
+                  updated_at = excluded.updated_at
+              `).bind(trackingId, now, now, now).run();
+            } else if (env.EMAILS) {
+              const existing = await env.EMAILS.get(`track:${trackingId}`, 'json') as any || { opens: 0, clicks: 0, firstClickedAt: null, lastClickedAt: null };
+              existing.clicks = (existing.clicks || 0) + 1;
+              if (!existing.firstClickedAt) existing.firstClickedAt = now;
+              existing.lastClickedAt = now;
+              await env.EMAILS.put(`track:${trackingId}`, JSON.stringify(existing));
+            }
           })()
         );
       }
@@ -247,13 +541,33 @@ export default {
     // API: GET /api/track/stats
     if (url.pathname === '/api/track/stats') {
       const tid = url.searchParams.get('tid');
-      if (!tid || !env.EMAILS) {
+      if (!tid) {
         return new Response(JSON.stringify({ opens: 0, clicks: 0 }), {
           headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
         });
       }
-      const data = await env.EMAILS.get(`track:${tid}`, 'json') || { opens: 0, clicks: 0 };
-      return new Response(JSON.stringify(data), {
+      if (env.DB) {
+        const row = (await env.DB.prepare('SELECT opens, clicks, first_opened_at, last_opened_at, first_clicked_at, last_clicked_at FROM tracking WHERE id = ?').bind(tid).first()) as any;
+        if (row) {
+          return new Response(JSON.stringify({
+            opens: row.opens || 0,
+            clicks: row.clicks || 0,
+            firstOpenedAt: row.first_opened_at,
+            lastOpenedAt: row.last_opened_at,
+            firstClickedAt: row.first_clicked_at,
+            lastClickedAt: row.last_clicked_at
+          }), {
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      if (env.EMAILS) {
+        const data = await env.EMAILS.get(`track:${tid}`, 'json') || { opens: 0, clicks: 0 };
+        return new Response(JSON.stringify(data), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ opens: 0, clicks: 0 }), {
         headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
@@ -469,30 +783,102 @@ export default {
       });
     }
 
+    // Resolve User Role & Permitted Mailbox Accounts
+    const userPerms = resolveUserPermissions(authEmail);
+    const hasFullAccess = userPerms.allowedAccounts.includes('*');
+
+    // Filter accounts visible to this user
+    const userAccessibleAccounts = KNOWN_ACCOUNTS.filter(
+      acc => hasFullAccess || userPerms.allowedAccounts.includes(acc.email.toLowerCase())
+    );
+
+    // SECURITY & ADMIN API: GET & POST /api/admin/security-settings
+    if (url.pathname === '/api/admin/security-settings') {
+      if (userPerms.role !== 'superadmin' && userPerms.role !== 'admin') {
+        return new Response(JSON.stringify({ error: 'Permission denied. Admin role required.' }), {
+          status: 403,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (request.method === 'POST') {
+        const body = (await request.json()) as any;
+        if (env.EMAILS) {
+          await env.EMAILS.put('settings:security', JSON.stringify({
+            blocklist: body.blocklist || [],
+            allowlist: body.allowlist || [],
+            spamKeywords: body.spamKeywords || [],
+          }));
+        }
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // GET settings
+      let secSettings = {
+        blocklist: [],
+        allowlist: [],
+        spamKeywords: ['claim prize', 'wire money', 'urgent transfer', 'crypto investment', 'bitcoin bonus', 'verify bank login', 'account suspended click here'],
+      };
+      if (env.EMAILS) {
+        secSettings = (await env.EMAILS.get('settings:security', 'json')) || secSettings;
+      }
+      return new Response(JSON.stringify({ settings: secSettings, team: TEAM_MEMBERS, user: userPerms }), {
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
+
     // API: GET /api/messages
     if (url.pathname === '/api/messages') {
       const folder = url.searchParams.get('folder') || 'inbox';
-      const selectedAccount = (url.searchParams.get('account') || 'all').toLowerCase();
-      const allFetched: any[] = [];
+      let selectedAccount = (url.searchParams.get('account') || 'all').toLowerCase();
 
-      if (env.EMAILS) {
-        const list = await env.EMAILS.list({ prefix: 'msg:' });
-        for (const key of list.keys) {
-          const item = await env.EMAILS.get(key.name, 'json');
-          if (item) {
-            if (!item.account) {
-              item.account = resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to);
-            }
-            allFetched.push(item);
-          }
+      // Enforce Role Restriction: If member tries to access unpermitted account, default to their first allowed account
+      if (!hasFullAccess) {
+        if (selectedAccount === 'all' || !userPerms.allowedAccounts.includes(selectedAccount)) {
+          selectedAccount = userPerms.allowedAccounts[0] || 'info@devgeeksnexus.com';
         }
       }
 
-      // Compute statistics per account and folder
+      const allFetched: any[] = [];
+
+      if (env.DB) {
+        try {
+          const { results } = await env.DB.prepare('SELECT * FROM messages ORDER BY date DESC').all();
+          for (const r of (results || []) as any[]) {
+            const msg = rowToMessage(r);
+            if (msg) allFetched.push(msg);
+          }
+        } catch (dbErr) {
+          console.error('D1 query error:', dbErr);
+        }
+      }
+
+      // Also merge any existing messages stored in KV
+      if (env.EMAILS) {
+        try {
+          const index: string[] = (await env.EMAILS.get('index:messages', 'json')) || [];
+          for (const entry of index) {
+            const keyName = entry.startsWith('msg:') ? entry : `msg:${entry}`;
+            const item = (await env.EMAILS.get(keyName, 'json')) as any;
+            if (item && !allFetched.some((m) => m.id === item.id)) {
+              if (!item.account) {
+                item.account = resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to);
+              }
+              allFetched.push(item);
+            }
+          }
+        } catch (kvErr) {
+          console.error('KV index read error:', kvErr);
+        }
+      }
+
+      // Compute statistics per account and folder (filtered by user permissions)
       const stats: Record<string, { unread: number; total: number }> = {
         'all': { unread: 0, total: 0 },
       };
-      KNOWN_ACCOUNTS.forEach((acc) => {
+      userAccessibleAccounts.forEach((acc) => {
         stats[acc.email.toLowerCase()] = { unread: 0, total: 0 };
       });
 
@@ -500,16 +886,24 @@ export default {
         inbox: 0,
         drafts: 0,
         sent: 0,
+        spam: 0,
       };
 
       for (const item of allFetched) {
         const itemAcc = (item.account || resolveAccount(item.from || item.to)).toLowerCase();
+        
+        // Skip messages the user is not allowed to see
+        if (!hasFullAccess && !userPerms.allowedAccounts.includes(itemAcc)) {
+          continue;
+        }
+
         const matchesCurrentAcc = selectedAccount === 'all' || itemAcc === selectedAccount;
 
         if (matchesCurrentAcc) {
           if (item.folder === 'inbox') folderCounts.inbox++;
           if (item.folder === 'drafts') folderCounts.drafts++;
           if (item.folder === 'sent') folderCounts.sent++;
+          if (item.folder === 'spam') folderCounts.spam++;
         }
 
         if (item.folder === 'inbox') {
@@ -524,9 +918,15 @@ export default {
 
       // Filter messages for current view
       const messages = allFetched.filter((item) => {
+        const itemAcc = (item.account || resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to)).toLowerCase();
+        
+        // Strict role permission filter
+        if (!hasFullAccess && !userPerms.allowedAccounts.includes(itemAcc)) {
+          return false;
+        }
+
         if (folder && item.folder !== folder) return false;
         if (selectedAccount !== 'all') {
-          const itemAcc = (item.account || resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to)).toLowerCase();
           const toStr = (item.to || '').toLowerCase();
           const fromStr = (item.from || '').toLowerCase();
           return itemAcc === selectedAccount || toStr.includes(selectedAccount) || fromStr.includes(selectedAccount);
@@ -541,7 +941,8 @@ export default {
           messages,
           stats,
           folderCounts,
-          accounts: KNOWN_ACCOUNTS,
+          accounts: userAccessibleAccounts,
+          currentUser: userPerms,
         }),
         {
           headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
@@ -589,15 +990,16 @@ export default {
           attachments: attachments || [],
         };
 
-        if (env.EMAILS) {
+        if (env.DB) {
           if (id) {
-            const list = await env.EMAILS.list({ prefix: 'msg:' });
-            const oldKey = list.keys.find((k: any) => k.name.endsWith(id));
-            if (oldKey) {
-              await env.EMAILS.delete(oldKey.name);
-            }
+            await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(id).run();
           }
-          await env.EMAILS.put(`msg:${draftDate}:${draftId}`, JSON.stringify(draftMsg));
+          await saveMessageToDB(env.DB, draftMsg);
+        } else if (env.EMAILS) {
+          if (id) {
+            await deleteMessageFromKV(env.EMAILS, id);
+          }
+          await saveMessageToKV(env.EMAILS, draftMsg);
         }
 
         return new Response(JSON.stringify({ success: true, draft: draftMsg }), {
@@ -662,7 +1064,13 @@ export default {
           if (trackOpens) {
             finalHtml += `<img src="${origin}/api/track/open?tid=${trackingId}" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;" />`;
           }
-          if (env.EMAILS) {
+          if (env.DB) {
+            await env.DB.prepare(`
+              INSERT INTO tracking (id, opens, clicks, recipient, subject, updated_at)
+              VALUES (?, 0, 0, ?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET recipient = excluded.recipient, subject = excluded.subject, updated_at = excluded.updated_at
+            `).bind(trackingId, toList.join(', '), subject || '', new Date().toISOString()).run();
+          } else if (env.EMAILS) {
             await env.EMAILS.put(`track:${trackingId}`, JSON.stringify({ opens: 0, clicks: 0, recipient: toList.join(', '), subject: subject || '' }));
           }
         }
@@ -690,8 +1098,11 @@ export default {
               trackingId,
             };
 
-            if (env.EMAILS) {
-              await env.EMAILS.put(`scheduled:${schedTime}:${schedId}`, JSON.stringify(schedPayload));
+            if (env.DB) {
+              await env.DB.prepare(`
+                INSERT OR REPLACE INTO scheduled_emails (id, scheduled_time, payload_json, created_at)
+                VALUES (?, ?, ?, ?)
+              `).bind(schedId, schedTime, JSON.stringify(schedPayload), Date.now()).run();
               // Also store in Drafts/Scheduled so user sees it in their mailbox
               const schedMsg = {
                 id: schedId,
@@ -710,7 +1121,28 @@ export default {
                 scheduledTime: schedTime,
                 attachments: attachments || [],
               };
-              await env.EMAILS.put(`msg:${schedMsg.date}:${schedId}`, JSON.stringify(schedMsg));
+              await saveMessageToDB(env.DB, schedMsg);
+            } else if (env.EMAILS) {
+              await scheduleMessageInKV(env.EMAILS, schedId, schedPayload);
+              // Also store in Drafts/Scheduled so user sees it in their mailbox
+              const schedMsg = {
+                id: schedId,
+                account: senderEmail,
+                from: senderEmail,
+                fromName: senderDisplayName,
+                to: toList.join(', '),
+                subject: `[Scheduled: ${new Date(schedTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })}] ` + (subject || ''),
+                text: text || '',
+                html: html || '',
+                date: new Date().toISOString(),
+                folder: 'drafts',
+                isRead: true,
+                isStarred: false,
+                isScheduled: true,
+                scheduledTime: schedTime,
+                attachments: attachments || [],
+              };
+              await saveMessageToKV(env.EMAILS, schedMsg);
             }
 
             return new Response(JSON.stringify({ success: true, scheduled: true, scheduledAt: new Date(schedTime).toISOString() }), {
@@ -764,15 +1196,15 @@ export default {
         }
 
         // If this message was sent from a saved draft, delete the draft now
-        if (env.EMAILS && draftId) {
-          const list = await env.EMAILS.list({ prefix: 'msg:' });
-          const draftKey = list.keys.find((k: any) => k.name.endsWith(draftId));
-          if (draftKey) {
-            await env.EMAILS.delete(draftKey.name);
+        if (draftId) {
+          if (env.DB) {
+            await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(draftId).run();
+          } else if (env.EMAILS) {
+            await deleteMessageFromKV(env.EMAILS, draftId);
           }
         }
 
-        // Store copy in Sent folder in KV
+        // Store copy in Sent folder
         const sentId = `sent_${Date.now()}`;
         const sentMsg = {
           id: sentId,
@@ -794,8 +1226,10 @@ export default {
           trackingId: trackingId || null,
         };
 
-        if (env.EMAILS) {
-          await env.EMAILS.put(`msg:${sentMsg.date}:${sentId}`, JSON.stringify(sentMsg));
+        if (env.DB) {
+          await saveMessageToDB(env.DB, sentMsg);
+        } else if (env.EMAILS) {
+          await saveMessageToKV(env.EMAILS, sentMsg);
         }
 
         return new Response(JSON.stringify({ success: true, message: sentMsg }), {
@@ -815,21 +1249,39 @@ export default {
         const body = (await request.json()) as any;
         const { id, action, isRead } = body;
 
-        if (env.EMAILS) {
-          const list = await env.EMAILS.list({ prefix: 'msg:' });
-          const target = list.keys.find((k: any) => k.name.endsWith(id));
-
-          if (target) {
+        if (env.DB) {
+          if (action === 'delete') {
+            await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(id).run();
+          } else if (action === 'toggleStar') {
+            await env.DB.prepare('UPDATE messages SET is_starred = CASE WHEN is_starred = 1 THEN 0 ELSE 1 END WHERE id = ?').bind(id).run();
+          } else if (typeof isRead === 'boolean') {
+            await env.DB.prepare('UPDATE messages SET is_read = ? WHERE id = ?').bind(isRead ? 1 : 0, id).run();
+          }
+        } else if (env.EMAILS) {
+          try {
             if (action === 'delete') {
-              await env.EMAILS.delete(target.name);
+              await deleteMessageFromKV(env.EMAILS, id);
             } else {
-              const item = await env.EMAILS.get(target.name, 'json');
+              let item = (await env.EMAILS.get(`msg:${id}`, 'json')) as any;
+              let targetKey = `msg:${id}`;
+              if (!item) {
+                const index: string[] = (await env.EMAILS.get('index:messages', 'json')) || [];
+                const matchedKey = index.find((k: string) => k.endsWith(id));
+                if (matchedKey) {
+                  item = (await env.EMAILS.get(matchedKey, 'json')) as any;
+                  targetKey = matchedKey;
+                }
+              }
               if (item) {
                 if (typeof isRead === 'boolean') item.isRead = isRead;
                 if (action === 'toggleStar') item.isStarred = !item.isStarred;
-                await env.EMAILS.put(target.name, JSON.stringify(item));
+                if (body.folder) item.folder = body.folder;
+                if (typeof body.isSpam === 'boolean') item.isSpam = body.isSpam;
+                await env.EMAILS.put(targetKey, JSON.stringify(item));
               }
             }
+          } catch (e) {
+            console.error('KV PATCH error:', e);
           }
         }
         return new Response(JSON.stringify({ success: true }), {
@@ -976,6 +1428,45 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       user-select: text !important;
       -webkit-user-select: text !important;
     }
+    /* WebRTC Meet stage and frame sizing */
+    #meet-active-stage, #meet-container {
+      position: relative !important;
+      width: 100% !important;
+      height: 100% !important;
+      flex: 1 1 0% !important;
+      overflow: hidden !important;
+    }
+    #meet-container iframe {
+      position: absolute !important;
+      top: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      bottom: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      min-height: 100% !important;
+      border: none !important;
+      display: block !important;
+    }
+    /* Theme Toggle Dark Styles */
+    body.theme-dark { background-color: #020617 !important; color: #f8fafc !important; }
+    body.theme-dark #email-list-section { background-color: #0f172a !important; border-color: #1e293b !important; }
+    body.theme-dark #email-list-section .border-b { border-color: #1e293b !important; }
+    body.theme-dark #email-list-section .bg-slate-50 { background-color: #1e293b !important; }
+    body.theme-dark #email-list-section input { background-color: #1e293b !important; border-color: #334155 !important; color: #f8fafc !important; }
+    body.theme-dark #reading-pane { background-color: #0f172a !important; border-color: #1e293b !important; color: #f8fafc !important; }
+    body.theme-dark #reading-pane .border-b, body.theme-dark #reading-pane .border-t { border-color: #1e293b !important; }
+    body.theme-dark #reading-pane .bg-slate-50 { background-color: #1e293b !important; color: #cbd5e1 !important; }
+    body.theme-dark #reading-pane .text-slate-900, body.theme-dark #reading-pane .text-slate-800 { color: #f8fafc !important; }
+    body.theme-dark #reading-pane .text-slate-600, body.theme-dark #reading-pane .text-slate-700 { color: #cbd5e1 !important; }
+    body.theme-dark #dns-view, body.theme-dark #security-view { background-color: #020617 !important; color: #f8fafc !important; }
+    body.theme-dark #dns-view .bg-white, body.theme-dark #security-view .bg-white { background-color: #0f172a !important; border-color: #1e293b !important; color: #f8fafc !important; }
+    body.theme-dark #dns-view .text-slate-900, body.theme-dark #security-view .text-slate-900 { color: #f8fafc !important; }
+    body.theme-dark #security-view textarea { background-color: #1e293b !important; border-color: #334155 !important; color: #f8fafc !important; }
+    body.theme-dark #security-view table tr { border-color: #1e293b !important; }
+    body.theme-dark #security-view table th { color: #94a3b8 !important; }
+    body.theme-dark #security-view table td { color: #cbd5e1 !important; }
+    body.theme-dark #security-view table tr:hover { background-color: #1e293b/50 !important; }
   </style>
 </head>
 <body class="bg-slate-50 text-slate-800 h-screen h-screen-ios flex flex-col md:flex-row overflow-hidden">
@@ -1134,6 +1625,15 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         <span id="sent-count" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
       </button>
 
+      <!-- Spam / Quarantine -->
+      <button onclick="switchFolder('spam')" id="btn-spam" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid fa-ban w-4 text-rose-400"></i>
+          <span>Spam / Junk</span>
+        </div>
+        <span id="spam-count" class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-rose-300 font-mono">0</span>
+      </button>
+
       <div class="pt-2 pb-1 px-3">
         <div class="border-t border-slate-800"></div>
       </div>
@@ -1147,6 +1647,15 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         <span class="px-1.5 py-0.2 rounded text-[9px] bg-rose-950 text-rose-300 border border-rose-800/60 font-semibold uppercase">Live</span>
       </button>
 
+      <!-- Security & Administration (Roles, Spam blocklist, allowlist) -->
+      <button onclick="switchTab('security')" id="btn-security" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid fa-user-shield w-4 text-amber-400"></i>
+          <span>Security & Roles</span>
+        </div>
+        <span class="px-1.5 py-0.2 rounded text-[9px] bg-amber-950 text-amber-300 border border-amber-800/60 font-semibold uppercase">Admin</span>
+      </button>
+
       <!-- DNS -->
       <button onclick="switchTab('dns')" id="btn-dns" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
         <div class="flex items-center space-x-3">
@@ -1157,6 +1666,21 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       </button>
 
       <div class="pt-2 pb-1 px-3">
+        <div class="border-t border-slate-800"></div>
+      </div>
+
+      <!-- Theme Switcher (Dark / Light mode) -->
+      <div class="px-3 py-1 flex items-center justify-between text-xs text-slate-400">
+        <span class="flex items-center gap-2">
+          <i id="theme-icon" class="fa-solid fa-moon text-indigo-400"></i>
+          <span id="theme-label">Theme</span>
+        </span>
+        <button onclick="toggleTheme()" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs border border-slate-700 flex items-center gap-1.5 transition-colors">
+          <span id="theme-btn-text">Light Mode</span>
+        </button>
+      </div>
+
+      <div class="pt-1 pb-1 px-3">
         <div class="border-t border-slate-800"></div>
       </div>
 
@@ -1266,6 +1790,10 @@ function renderWebAppHtml(currentUserEmail?: string): string {
               <i class="fa-solid fa-reply text-xs"></i>
               <span>Reply</span>
             </button>
+            <button id="btn-detail-forward" onclick="forwardCurrentMessage()" class="px-2.5 py-1.5 bg-white hover:bg-indigo-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-700 hover:text-indigo-600 flex items-center space-x-1.5 active:scale-95 transition-all" title="Forward">
+              <i class="fa-solid fa-share text-xs"></i>
+              <span>Forward</span>
+            </button>
 
             <!-- AI Summary and Smart Reply Action Dropdown -->
             <div class="relative inline-block text-left">
@@ -1295,6 +1823,20 @@ function renderWebAppHtml(currentUserEmail?: string): string {
             <!-- Detail Content -->
         <div class="flex-1 overflow-y-auto p-4 sm:p-6 custom-scroll touch-scroll">
           
+          <!-- Quarantined Spam Warning Banner -->
+          <div id="detail-spam-notice" class="hidden mb-4 p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shadow-xs">
+            <div class="flex items-center space-x-2.5">
+              <i class="fa-solid fa-shield-virus text-rose-600 text-base"></i>
+              <div>
+                <span class="font-bold">Quarantined Spam Message</span>
+                <p id="spam-reason-text" class="text-[11px] text-rose-700 mt-0.5">Automated security rule match</p>
+              </div>
+            </div>
+            <button onclick="markNotSpam()" class="px-3 py-1 bg-white hover:bg-rose-100 text-rose-700 border border-rose-300 rounded-lg text-xs font-semibold shadow-xs transition-colors self-start sm:self-auto">
+              <i class="fa-solid fa-inbox mr-1"></i> Not Spam (Move to Inbox)
+            </button>
+          </div>
+
           <!-- AI Summary Box (dynamically populated) -->
           <div id="ai-summary-box" class="hidden mb-4 p-4 rounded-xl bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-100 text-slate-800 text-xs space-y-2">
             <div class="flex items-center justify-between">
@@ -1331,6 +1873,18 @@ function renderWebAppHtml(currentUserEmail?: string): string {
               <i class="fa-solid fa-paperclip mr-1 text-indigo-600"></i> Attachments
             </h3>
             <div id="attachments-grid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5"></div>
+          </div>
+
+          <!-- Bottom Action Buttons: Quick Reply & Forward -->
+          <div id="detail-bottom-actions" class="pt-6 mt-6 border-t border-slate-200 flex items-center space-x-3">
+            <button onclick="replyToCurrentMessage()" class="px-3.5 py-2 bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-300 rounded-xl text-xs font-semibold text-indigo-600 flex items-center space-x-2 shadow-xs active:scale-95 transition-all">
+              <i class="fa-solid fa-reply text-xs"></i>
+              <span>Reply</span>
+            </button>
+            <button onclick="forwardCurrentMessage()" class="px-3.5 py-2 bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-300 rounded-xl text-xs font-semibold text-slate-700 hover:text-indigo-600 flex items-center space-x-2 shadow-xs active:scale-95 transition-all">
+              <i class="fa-solid fa-share text-xs"></i>
+              <span>Forward</span>
+            </button>
           </div>
         </div>
       </div>
@@ -1530,6 +2084,109 @@ function renderWebAppHtml(currentUserEmail?: string): string {
             <span class="break-all"><strong>DMARC:</strong> v=DMARC1; p=none; ...</span>
             <span class="text-emerald-600 font-bold self-end sm:self-auto">PASS</span>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SECURITY & ROLES GOVERNANCE VIEW -->
+  <div id="security-view" class="hidden flex-1 p-4 sm:p-8 overflow-y-auto bg-slate-50 touch-scroll">
+    <div class="max-w-4xl mx-auto space-y-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-xl sm:text-2xl font-bold text-slate-900">Enterprise Security & Role Governance</h2>
+          <p class="text-xs sm:text-sm text-slate-500">Manage multi-user access permissions and automated inbound spam/phishing filtering.</p>
+        </div>
+        <button onclick="switchTab('mail')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg active:scale-95 transition-all">Back to Mailbox</button>
+      </div>
+
+      <!-- Team Role Management Table -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5 shadow-sm space-y-4">
+        <div class="flex items-center justify-between border-b border-slate-100 pb-3">
+          <div class="flex items-center space-x-2.5">
+            <div class="w-8 h-8 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center text-sm font-semibold">
+              <i class="fa-solid fa-users-gear"></i>
+            </div>
+            <div>
+              <h3 class="font-bold text-sm text-slate-900">Multi-User Role Management</h3>
+              <p class="text-xs text-slate-500">Restricts mailbox access and administrative privileges per authenticated user.</p>
+            </div>
+          </div>
+          <span class="px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-100 text-emerald-800">RBAC Active</span>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-xs">
+            <thead>
+              <tr class="border-b border-slate-100 text-slate-400 uppercase tracking-wider font-semibold">
+                <th class="py-2.5 px-3">Team Member</th>
+                <th class="py-2.5 px-3">Login Email</th>
+                <th class="py-2.5 px-3">Assigned Role</th>
+                <th class="py-2.5 px-3">Permitted Mailboxes</th>
+                <th class="py-2.5 px-3">Status</th>
+              </tr>
+            </thead>
+            <tbody id="team-members-table-body" class="divide-y divide-slate-100">
+              <!-- Dynamically populated by loadSecuritySettings() -->
+            </tbody>
+          </table>
+        </div>
+        <p class="text-[11px] text-slate-500 italic"><i class="fa-solid fa-circle-info mr-1 text-indigo-500"></i> Members are strictly isolated to their assigned departmental mailbox (e.g., info@devgeeksnexus.com) and cannot access or read admin@devgeeksnexus.com or ayomidebobani@.</p>
+      </div>
+
+      <!-- Automated Spam & Phishing Filtering Rules -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5 shadow-sm space-y-5">
+        <div class="flex items-center justify-between border-b border-slate-100 pb-3">
+          <div class="flex items-center space-x-2.5">
+            <div class="w-8 h-8 rounded-lg bg-rose-50 text-rose-600 flex items-center justify-center text-sm font-semibold">
+              <i class="fa-solid fa-shield-virus"></i>
+            </div>
+            <div>
+              <h3 class="font-bold text-sm text-slate-900">Automated Spam & Phishing Filters</h3>
+              <p class="text-xs text-slate-500">Configure real-time automated quarantine rules for all incoming messages.</p>
+            </div>
+          </div>
+          <button onclick="saveSecuritySettings()" id="btn-save-security" class="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-sm active:scale-95 transition-all flex items-center space-x-1.5">
+            <i class="fa-solid fa-floppy-disk"></i>
+            <span>Save Security Rules</span>
+          </button>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- Blocklist -->
+          <div class="space-y-1.5">
+            <label class="block text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+              <i class="fa-solid fa-ban text-rose-500"></i>
+              <span>Sender Blocklist (Domains or Emails)</span>
+            </label>
+            <p class="text-[11px] text-slate-500">One per line. Any incoming mail matching these addresses or domains will be immediately quarantined to Spam.</p>
+            <textarea id="security-blocklist" rows="5" class="w-full text-xs font-mono p-2.5 rounded-lg border border-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500" placeholder="bad-spammer.com&#10;phishing-alert@unknown.net"></textarea>
+          </div>
+
+          <!-- Allowlist -->
+          <div class="space-y-1.5">
+            <label class="block text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+              <i class="fa-solid fa-circle-check text-emerald-500"></i>
+              <span>Trusted Senders (Allowlist)</span>
+            </label>
+            <p class="text-[11px] text-slate-500">One per line. Trusted partner domains that always bypass spam filters directly to Inbox.</p>
+            <textarea id="security-allowlist" rows="5" class="w-full text-xs font-mono p-2.5 rounded-lg border border-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500" placeholder="google.com&#10;resend.com&#10;client-partner.org"></textarea>
+          </div>
+        </div>
+
+        <!-- Phishing & Spam Keywords -->
+        <div class="space-y-1.5">
+          <label class="block text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+            <i class="fa-solid fa-triangle-exclamation text-amber-500"></i>
+            <span>Phishing & Spam Trigger Keywords</span>
+          </label>
+          <p class="text-[11px] text-slate-500">Comma-separated terms. Inbound emails with these phrases in the subject or body will be quarantined as Spam.</p>
+          <textarea id="security-keywords" rows="3" class="w-full text-xs font-mono p-2.5 rounded-lg border border-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500" placeholder="claim prize, wire money, crypto investment, bitcoin bonus, verify bank login, account suspended click here"></textarea>
+        </div>
+
+        <div id="security-save-feedback" class="hidden text-xs font-medium text-emerald-600 flex items-center gap-1.5">
+          <i class="fa-solid fa-circle-check"></i>
+          <span>Security rules saved successfully and updated in Cloudflare KV!</span>
         </div>
       </div>
     </div>
@@ -1796,6 +2453,8 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       if (folderCounts) {
         document.getElementById('drafts-count').textContent = folderCounts.drafts || 0;
         document.getElementById('sent-count').textContent = folderCounts.sent || 0;
+        const spamEl = document.getElementById('spam-count');
+        if (spamEl) spamEl.textContent = folderCounts.spam || 0;
       }
     }
 
@@ -1930,6 +2589,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
               <div class="flex items-center space-x-1.5">
                 <span class="px-1.5 py-0.5 rounded border text-[9px] font-mono font-medium uppercase \${badgeClass}">\${badgeText}</span>
                 \${isDraft ? '<span class="px-1.5 py-0.5 rounded border text-[9px] font-semibold bg-amber-100 text-amber-800 border-amber-300">DRAFT</span>' : ''}
+                \${m.isSpam ? '<span class="px-1.5 py-0.5 rounded border text-[9px] font-semibold bg-rose-100 text-rose-800 border-rose-300">SPAM</span>' : ''}
               </div>
               <div class="flex items-center space-x-2 text-slate-400">
                 \${(m.attachments && m.attachments.length > 0) ? '<span><i class="fa-solid fa-paperclip mr-1"></i>' + m.attachments.length + '</span>' : ''}
@@ -1972,17 +2632,35 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       document.getElementById('detail-from').textContent = selectedMsg.from;
       document.getElementById('detail-to').textContent = selectedMsg.to || '(No Recipient)';
 
+      // Quarantined Spam Notice
+      const spamNotice = document.getElementById('detail-spam-notice');
+      if (selectedMsg.isSpam || selectedMsg.folder === 'spam') {
+        if (spamNotice) {
+          spamNotice.classList.remove('hidden');
+          const reasonEl = document.getElementById('spam-reason-text');
+          if (reasonEl) reasonEl.textContent = selectedMsg.spamReason || 'Sender or content matched automated security quarantine rule';
+        }
+      } else {
+        if (spamNotice) spamNotice.classList.add('hidden');
+      }
+
       // Action buttons adaptation for Drafts
       const isDraft = selectedMsg.folder === 'drafts';
       const editDraftBtn = document.getElementById('btn-detail-edit-draft');
       const replyBtn = document.getElementById('btn-detail-reply');
+      const forwardBtn = document.getElementById('btn-detail-forward');
+      const bottomActions = document.getElementById('detail-bottom-actions');
 
       if (isDraft) {
         editDraftBtn.classList.remove('hidden');
         replyBtn.classList.add('hidden');
+        if (forwardBtn) forwardBtn.classList.add('hidden');
+        if (bottomActions) bottomActions.classList.add('hidden');
       } else {
         editDraftBtn.classList.add('hidden');
         replyBtn.classList.remove('hidden');
+        if (forwardBtn) forwardBtn.classList.remove('hidden');
+        if (bottomActions) bottomActions.classList.remove('hidden');
       }
 
       // Mailbox Badge
@@ -2097,8 +2775,9 @@ function renderWebAppHtml(currentUserEmail?: string): string {
     function replyToCurrentMessage() {
       if (!selectedMsg) return;
       openCompose();
-      document.getElementById('compose-to').value = selectedMsg.from;
-      document.getElementById('compose-subject').value = selectedMsg.subject.startsWith('Re:') ? selectedMsg.subject : 'Re: ' + selectedMsg.subject;
+      document.getElementById('compose-to').value = selectedMsg.from || '';
+      const subj = selectedMsg.subject || '';
+      document.getElementById('compose-subject').value = subj.startsWith('Re:') ? subj : 'Re: ' + subj;
       
       const accKey = (selectedMsg.account || selectedMsg.to || '').toLowerCase();
       if (accKey.includes('ayomidebobani')) {
@@ -2108,6 +2787,60 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       } else {
         document.getElementById('compose-from').value = 'info@devgeeksnexus.com';
       }
+
+      const editor = document.getElementById('compose-editor');
+      const senderDisplay = selectedMsg.fromName ? (selectedMsg.fromName + ' &lt;' + selectedMsg.from + '&gt;') : selectedMsg.from;
+      const formattedDate = new Date(selectedMsg.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\n/g, '<br/>') + '</p>' : '');
+
+      editor.innerHTML = '<p></p><br><div class="gmail_quote" style="border-left: 2px solid #cbd5e1; padding-left: 10px; margin-left: 2px; color: #64748b; font-size: 13px;"><p style="margin: 0 0 6px 0;">On ' + formattedDate + ', ' + senderDisplay + ' wrote:</p><div>' + origBody + '</div></div>';
+      setTimeout(function() {
+        editor.focus();
+      }, 100);
+    }
+
+    function forwardCurrentMessage() {
+      if (!selectedMsg) return;
+      openCompose();
+      document.getElementById('compose-to').value = '';
+      setTimeout(function() {
+        var toInput = document.getElementById('compose-to');
+        if (toInput) toInput.focus();
+      }, 100);
+
+      const origSubject = selectedMsg.subject || '';
+      document.getElementById('compose-subject').value = origSubject.toLowerCase().startsWith('fwd:') ? origSubject : 'Fwd: ' + origSubject;
+
+      const accKey = (selectedMsg.account || selectedMsg.to || '').toLowerCase();
+      if (accKey.includes('ayomidebobani')) {
+        document.getElementById('compose-from').value = 'ayomidebobani@devgeeksnexus.com';
+      } else if (accKey.includes('admin')) {
+        document.getElementById('compose-from').value = 'admin@devgeeksnexus.com';
+      } else {
+        document.getElementById('compose-from').value = 'info@devgeeksnexus.com';
+      }
+
+      // Carry forward attachments if present
+      if (selectedMsg.attachments && selectedMsg.attachments.length > 0) {
+        attachedFiles = selectedMsg.attachments.slice();
+        renderAttachmentTray();
+      }
+
+      const editor = document.getElementById('compose-editor');
+      const senderDisplay = selectedMsg.fromName ? (selectedMsg.fromName + ' &lt;' + selectedMsg.from + '&gt;') : selectedMsg.from;
+      const formattedDate = new Date(selectedMsg.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+      const origTo = selectedMsg.to ? '<br><strong>To:</strong> ' + selectedMsg.to : '';
+      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\n/g, '<br/>') + '</p>' : '');
+
+      editor.innerHTML = '<p></p><br><div class="forwarded_message" style="border-left: 2px solid #cbd5e1; padding-left: 12px; margin-left: 2px; color: #475569; font-size: 13px;">' +
+        '<p style="margin: 0 0 8px 0; color: #64748b; font-size: 12px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">' +
+        '---------- Forwarded message ---------<br>' +
+        '<strong>From:</strong> ' + senderDisplay + '<br>' +
+        '<strong>Date:</strong> ' + formattedDate + '<br>' +
+        '<strong>Subject:</strong> ' + origSubject + origTo +
+        '</p>' +
+        '<div>' + origBody + '</div>' +
+      '</div>';
     }
 
     async function deleteCurrentMessage() {
@@ -2125,15 +2858,139 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       loadMessages();
     }
 
+    async function markNotSpam() {
+      if (!selectedMsg) return;
+      try {
+        await fetch('/api/messages', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: selectedMsg.id, folder: 'inbox', isSpam: false })
+        });
+        selectedMsg.folder = 'inbox';
+        selectedMsg.isSpam = false;
+        const spamNotice = document.getElementById('detail-spam-notice');
+        if (spamNotice) spamNotice.classList.add('hidden');
+        alert('Message moved back to Inbox successfully.');
+        loadMessages();
+      } catch (e) {
+        alert('Failed to move message to inbox');
+      }
+    }
+
+    async function loadSecuritySettings() {
+      try {
+        const res = await fetch('/api/admin/security-settings');
+        if (!res.ok) return;
+        const data = await res.json();
+        
+        // Populate Team Member Roster
+        const tbody = document.getElementById('team-members-table-body');
+        if (tbody && data.teamMembers) {
+          tbody.innerHTML = data.teamMembers.map(m => {
+            const roleBadge = m.role === 'superadmin' 
+              ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-700">Superadmin</span>'
+              : m.role === 'admin'
+              ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-700">Admin</span>'
+              : '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-700">Member</span>';
+            const accs = m.allowedAccounts.includes('*')
+              ? '<span class="font-mono text-emerald-600 font-semibold">All Mailboxes (*)</span>'
+              : '<span class="font-mono text-slate-600">' + m.allowedAccounts.join(', ') + '</span>';
+            return '<tr class="hover:bg-slate-50/50 transition-colors">' +
+              '<td class="py-2.5 px-3 font-semibold text-slate-900">' + m.name + '</td>' +
+              '<td class="py-2.5 px-3 font-mono text-slate-600">' + m.email + '</td>' +
+              '<td class="py-2.5 px-3">' + roleBadge + '</td>' +
+              '<td class="py-2.5 px-3">' + accs + '</td>' +
+              '<td class="py-2.5 px-3"><span class="w-2 h-2 rounded-full bg-emerald-500 inline-block mr-1"></span> Active</td>' +
+              '</tr>';
+          }).join('');
+        }
+
+        // Populate Security Rules
+        if (data.settings) {
+          const bl = document.getElementById('security-blocklist');
+          const al = document.getElementById('security-allowlist');
+          const kw = document.getElementById('security-keywords');
+          if (bl) bl.value = (data.settings.blocklist || []).join('\n');
+          if (al) al.value = (data.settings.allowlist || []).join('\n');
+          if (kw) kw.value = (data.settings.spamKeywords || []).join(', ');
+        }
+      } catch (err) {
+        console.error('Failed to load security settings:', err);
+      }
+    }
+
+    async function saveSecuritySettings() {
+      const btn = document.getElementById('btn-save-security');
+      const feedback = document.getElementById('security-save-feedback');
+      const bl = document.getElementById('security-blocklist');
+      const al = document.getElementById('security-allowlist');
+      const kw = document.getElementById('security-keywords');
+
+      const blocklist = (bl ? bl.value : '').split('\n').map(s => s.trim().toLowerCase()).filter(Boolean);
+      const allowlist = (al ? al.value : '').split('\n').map(s => s.trim().toLowerCase()).filter(Boolean);
+      const spamKeywords = (kw ? kw.value : '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+      if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+      try {
+        const res = await fetch('/api/admin/security-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ blocklist, allowlist, spamKeywords })
+        });
+        if (res.ok) {
+          if (feedback) {
+            feedback.classList.remove('hidden');
+            setTimeout(() => feedback.classList.add('hidden'), 4000);
+          }
+        } else {
+          const err = await res.json();
+          alert(err.error || 'Failed to save security settings');
+        }
+      } catch (e) {
+        alert('Network error while saving security rules');
+      } finally {
+        if (btn) btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> <span>Save Security Rules</span>';
+      }
+    }
+
+    function toggleTheme() {
+      const isDark = document.body.classList.toggle('theme-dark');
+      const text = document.getElementById('theme-btn-text');
+      const icon = document.getElementById('theme-icon');
+      if (isDark) {
+        if (text) text.textContent = 'Light Mode';
+        if (icon) icon.className = 'fa-solid fa-sun text-amber-400';
+        localStorage.setItem('nexus_theme', 'dark');
+      } else {
+        if (text) text.textContent = 'Dark Mode';
+        if (icon) icon.className = 'fa-solid fa-moon text-indigo-400';
+        localStorage.setItem('nexus_theme', 'light');
+      }
+    }
+
+    function initTheme() {
+      const saved = localStorage.getItem('nexus_theme');
+      if (saved === 'dark') {
+        document.body.classList.add('theme-dark');
+        const text = document.getElementById('theme-btn-text');
+        const icon = document.getElementById('theme-icon');
+        if (text) text.textContent = 'Light Mode';
+        if (icon) icon.className = 'fa-solid fa-sun text-amber-400';
+      }
+    }
+
     function switchFolder(f) {
       currentFolder = f;
       document.getElementById('folder-title').textContent = f.toUpperCase();
       
-      const folders = ['inbox', 'drafts', 'sent'];
+      const folders = ['inbox', 'drafts', 'sent', 'spam'];
       folders.forEach(fold => {
         const btn = document.getElementById('btn-' + fold);
+        if (!btn) return;
         if (fold === f) {
-          btn.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium';
+          btn.className = fold === 'spam'
+            ? 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-rose-600/20 text-rose-300 font-semibold'
+            : 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium';
         } else {
           btn.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
         }
@@ -2149,24 +3006,32 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       const mailView = document.getElementById('mail-view');
       const dnsView = document.getElementById('dns-view');
       const meetView = document.getElementById('meet-view');
+      const securityView = document.getElementById('security-view');
       const btnMeet = document.getElementById('btn-meet');
       const btnDns = document.getElementById('btn-dns');
+      const btnSecurity = document.getElementById('btn-security');
 
-      mailView.classList.add('hidden');
-      dnsView.classList.add('hidden');
-      meetView.classList.add('hidden');
+      if (mailView) mailView.classList.add('hidden');
+      if (dnsView) dnsView.classList.add('hidden');
+      if (meetView) meetView.classList.add('hidden');
+      if (securityView) securityView.classList.add('hidden');
 
-      btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
-      btnDns.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
+      if (btnMeet) btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
+      if (btnDns) btnDns.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
+      if (btnSecurity) btnSecurity.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
 
       if (t === 'meet') {
-        meetView.classList.remove('hidden');
-        btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-rose-600/20 text-rose-300 font-semibold';
+        if (meetView) meetView.classList.remove('hidden');
+        if (btnMeet) btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-rose-600/20 text-rose-300 font-semibold';
       } else if (t === 'dns') {
-        dnsView.classList.remove('hidden');
-        btnDns.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium';
+        if (dnsView) dnsView.classList.remove('hidden');
+        if (btnDns) btnDns.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-indigo-600/20 text-indigo-400 font-medium';
+      } else if (t === 'security') {
+        if (securityView) securityView.classList.remove('hidden');
+        if (btnSecurity) btnSecurity.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-amber-600/20 text-amber-300 font-medium';
+        loadSecuritySettings();
       } else {
-        mailView.classList.remove('hidden');
+        if (mailView) mailView.classList.remove('hidden');
       }
       toggleSidebar(false);
     }
@@ -2219,8 +3084,14 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         configOverwrite: {
           startWithAudioMuted: false,
           startWithVideoMuted: false,
-          prejoinPageEnabled: true,
-          disableDeepLinking: true
+          prejoinConfig: {
+            enabled: false
+          },
+          prejoinPageEnabled: false,
+          skipPrejoin: true,
+          disableDeepLinking: true,
+          enableWelcomePage: false,
+          enableClosePage: false
         },
         interfaceConfigOverwrite: {
           SHOW_JITSI_WATERMARK: false,
@@ -2910,6 +3781,8 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       }
     });
 
+    initTheme();
+
     // Check URL parameters for direct meeting room link
     const urlParams = new URLSearchParams(window.location.search);
     const meetParam = urlParams.get('meet');
@@ -2949,12 +3822,25 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
       overflow: hidden;
       font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
     }
-    #meet-stage, #standalone-jitsi-container, #standalone-jitsi-container iframe {
+    #meet-stage, #standalone-jitsi-container {
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      overflow: hidden !important;
+    }
+    #standalone-jitsi-container iframe {
+      position: absolute !important;
+      top: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      bottom: 0 !important;
       width: 100% !important;
       height: 100% !important;
       min-height: 100% !important;
+      max-height: 100% !important;
       border: none !important;
-      display: block;
+      display: block !important;
     }
   </style>
 </head>
@@ -3046,7 +3932,7 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
 
     <!-- Active Conference Fullscreen Stage -->
     <div id="meet-stage" class="hidden absolute inset-0 w-full h-full bg-slate-950">
-      <div id="standalone-jitsi-container" class="w-full h-full"></div>
+      <div id="standalone-jitsi-container" class="absolute inset-0 w-full h-full"></div>
     </div>
 
     <!-- Leave Call Screen -->
@@ -3069,6 +3955,13 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
     const roomName = "${safeRoom}";
     let jitsiApi = null;
     let participantName = "";
+
+    try {
+      const sp = new URLSearchParams(window.location.search);
+      if (sp.has('name') && document.getElementById('guest-name')) {
+        document.getElementById('guest-name').value = sp.get('name');
+      }
+    } catch (e) {}
 
     // Support enter key on input
     document.getElementById('guest-name').addEventListener('keydown', (e) => {
@@ -3098,8 +3991,14 @@ function renderStandaloneMeetHtml(initialRoom: string): string {
         configOverwrite: {
           startWithAudioMuted: false,
           startWithVideoMuted: false,
+          prejoinConfig: {
+            enabled: false
+          },
           prejoinPageEnabled: false,
-          disableDeepLinking: true
+          skipPrejoin: true,
+          disableDeepLinking: true,
+          enableWelcomePage: false,
+          enableClosePage: false
         },
         interfaceConfigOverwrite: {
           SHOW_JITSI_WATERMARK: false,
