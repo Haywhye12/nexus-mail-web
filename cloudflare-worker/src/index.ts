@@ -424,9 +424,19 @@ export default {
         isStarred: false,
       };
 
+      if (env.DB) {
+        try {
+          await saveMessageToDB(env.DB, payload);
+          console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare D1 (folder: ${payload.folder}).`);
+        } catch (dbErr) {
+          console.error('Error saving inbound email to D1:', dbErr);
+        }
+      }
       if (env.EMAILS) {
-        await env.EMAILS.put(`msg:${payload.date}:${msgId}`, JSON.stringify(payload));
-        console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare KV (folder: ${payload.folder}).`);
+        try {
+          await env.EMAILS.put(`msg:${payload.date}:${msgId}`, JSON.stringify(payload));
+          console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare KV (folder: ${payload.folder}).`);
+        } catch (kvErr) {}
       }
     } catch (err: any) {
       console.error('Inbound email error:', err.message || err);
@@ -949,6 +959,68 @@ export default {
       });
     }
 
+    // API: POST /api/admin/migrate-to-d1 (One-click migration of all KV messages into D1)
+    if (url.pathname === '/api/admin/migrate-to-d1' && request.method === 'POST') {
+      if (userPerms.role !== 'superadmin' && userPerms.role !== 'admin') {
+        return new Response(JSON.stringify({ error: 'Permission denied. Administrator access required.' }), {
+          status: 403,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (!env.DB) {
+        return new Response(JSON.stringify({ error: 'D1 database binding (DB) is not configured.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      const results = { migrated: 0, errors: [] };
+
+      try {
+        let keysToMigrate = [];
+        if (env.EMAILS) {
+          try {
+            const list = await env.EMAILS.list({ prefix: 'msg:' });
+            keysToMigrate = list.keys.map((k) => k.name);
+          } catch (e) {
+            console.warn('KV list failed, reading index:messages:', e);
+          }
+          if (keysToMigrate.length === 0) {
+            try {
+              const index = (await env.EMAILS.get('index:messages', 'json')) || [];
+              keysToMigrate = index.map((k) => k.startsWith('msg:') ? k : `msg:${k}`);
+            } catch (e) {}
+          }
+        }
+
+        for (const key of keysToMigrate) {
+          try {
+            const msg = await env.EMAILS.get(key, 'json');
+            if (msg) {
+              if (!msg.account) {
+                msg.account = resolveAccount(msg.from, msg.to);
+              }
+              await saveMessageToDB(env.DB, msg);
+              results.migrated++;
+            }
+          } catch (mErr) {
+            console.error(`Failed migrating key ${key}:`, mErr);
+            results.errors.push({ key, error: mErr.message });
+          }
+        }
+
+        return new Response(JSON.stringify({ success: true, ...results }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message || 'Migration failed.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     // STUDENT MANAGEMENT API: GET, POST, PUT, DELETE /api/admin/students
     if (url.pathname === '/api/admin/students') {
       if (userPerms.role !== 'superadmin' && userPerms.role !== 'admin') {
@@ -1338,29 +1410,44 @@ export default {
 
       const allFetched: any[] = [];
 
-      if (env.EMAILS) {
+      // Primary source: Cloudflare D1 Database
+      if (env.DB) {
+        try {
+          const query = await env.DB.prepare('SELECT * FROM messages ORDER BY date DESC').all();
+          if (query && Array.isArray(query.results)) {
+            for (const row of query.results) {
+              const msg = rowToMessage(row);
+              if (msg) allFetched.push(msg);
+            }
+          }
+        } catch (dbErr) {
+          console.error('D1 fetch error, attempting KV fallback:', dbErr);
+        }
+      }
+
+      // KV Fallback if D1 is empty or unavailable
+      if (allFetched.length === 0 && env.EMAILS) {
         try {
           const list = await env.EMAILS.list({ prefix: 'msg:' });
           for (const key of list.keys) {
             const item = (await env.EMAILS.get(key.name, 'json')) as any;
             if (item) {
               if (!item.account) {
-                item.account = resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to);
+                item.account = resolveAccount(item.from, item.to);
               }
               allFetched.push(item);
             }
           }
         } catch (kvErr) {
           console.error('KV list error:', kvErr);
-          // Fallback to index if list errors
           try {
-            const index: string[] = (await env.EMAILS.get('index:messages', 'json')) || [];
+            const index = (await env.EMAILS.get('index:messages', 'json')) || [];
             for (const entry of index) {
               const keyName = entry.startsWith('msg:') ? entry : `msg:${entry}`;
               const item = (await env.EMAILS.get(keyName, 'json')) as any;
               if (item && !allFetched.some((m) => m.id === item.id)) {
                 if (!item.account) {
-                  item.account = resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to);
+                  item.account = resolveAccount(item.from, item.to);
                 }
                 allFetched.push(item);
               }
@@ -1491,17 +1578,26 @@ export default {
           attachments: attachments || [],
         };
 
+        if (env.DB) {
+          try {
+            await saveMessageToDB(env.DB, draftMsg);
+          } catch (dbErr) {
+            console.error('Error saving draft to D1:', dbErr);
+          }
+        }
         if (env.EMAILS) {
           if (id) {
             try {
               const list = await env.EMAILS.list({ prefix: 'msg:' });
-              const oldKey = list.keys.find((k: any) => k.name.endsWith(id));
+              const oldKey = list.keys.find((k) => k.name.endsWith(id));
               if (oldKey) {
                 await env.EMAILS.delete(oldKey.name);
               }
             } catch (e) {}
           }
-          await env.EMAILS.put(`msg:${draftDate}:${draftId}`, JSON.stringify(draftMsg));
+          try {
+            await env.EMAILS.put(`msg:${draftDate}:${draftId}`, JSON.stringify(draftMsg));
+          } catch (e) {}
         }
 
         return new Response(JSON.stringify({ success: true, draft: draftMsg }), {
@@ -1686,14 +1782,21 @@ export default {
         }
 
         // If this message was sent from a saved draft, delete the draft now
-        if (draftId && env.EMAILS) {
-          try {
-            const list = await env.EMAILS.list({ prefix: 'msg:' });
-            const draftKey = list.keys.find((k: any) => k.name.endsWith(draftId));
-            if (draftKey) {
-              await env.EMAILS.delete(draftKey.name);
-            }
-          } catch (e) {}
+        if (draftId) {
+          if (env.DB) {
+            try {
+              await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(draftId).run();
+            } catch (e) {}
+          }
+          if (env.EMAILS) {
+            try {
+              const list = await env.EMAILS.list({ prefix: 'msg:' });
+              const draftKey = list.keys.find((k) => k.name.endsWith(draftId));
+              if (draftKey) {
+                await env.EMAILS.delete(draftKey.name);
+              }
+            } catch (e) {}
+          }
         }
 
         // Store copy in Sent folder
@@ -1718,8 +1821,17 @@ export default {
           trackingId: trackingId || null,
         };
 
+        if (env.DB) {
+          try {
+            await saveMessageToDB(env.DB, sentMsg);
+          } catch (dbErr) {
+            console.error('Error saving sent email to D1:', dbErr);
+          }
+        }
         if (env.EMAILS) {
-          await env.EMAILS.put(`msg:${sentMsg.date}:${sentId}`, JSON.stringify(sentMsg));
+          try {
+            await env.EMAILS.put(`msg:${sentMsg.date}:${sentId}`, JSON.stringify(sentMsg));
+          } catch (e) {}
         }
 
         return new Response(JSON.stringify({ success: true, message: sentMsg }), {
@@ -1739,16 +1851,39 @@ export default {
         const body = (await request.json()) as any;
         const { id, action, isRead } = body;
 
+        if (env.DB) {
+          try {
+            if (action === 'delete') {
+              await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(id).run();
+            } else {
+              if (typeof isRead === 'boolean') {
+                await env.DB.prepare('UPDATE messages SET is_read = ? WHERE id = ?').bind(isRead ? 1 : 0, id).run();
+              }
+              if (action === 'toggleStar') {
+                await env.DB.prepare('UPDATE messages SET is_starred = CASE WHEN is_starred = 1 THEN 0 ELSE 1 END WHERE id = ?').bind(id).run();
+              }
+              if (body.folder) {
+                await env.DB.prepare('UPDATE messages SET folder = ? WHERE id = ?').bind(body.folder, id).run();
+              }
+              if (typeof body.isSpam === 'boolean') {
+                await env.DB.prepare('UPDATE messages SET is_spam = ? WHERE id = ?').bind(body.isSpam ? 1 : 0, id).run();
+              }
+            }
+          } catch (dbErr) {
+            console.error('D1 PATCH error:', dbErr);
+          }
+        }
+
         if (env.EMAILS) {
           try {
             const list = await env.EMAILS.list({ prefix: 'msg:' });
-            const target = list.keys.find((k: any) => k.name.endsWith(id));
+            const target = list.keys.find((k) => k.name.endsWith(id));
 
             if (target) {
               if (action === 'delete') {
                 await env.EMAILS.delete(target.name);
               } else {
-                const item = (await env.EMAILS.get(target.name, 'json')) as any;
+                const item = (await env.EMAILS.get(target.name, 'json'));
                 if (item) {
                   if (typeof isRead === 'boolean') item.isRead = isRead;
                   if (action === 'toggleStar') item.isStarred = !item.isStarred;
