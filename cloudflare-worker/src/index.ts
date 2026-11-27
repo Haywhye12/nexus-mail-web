@@ -940,9 +940,14 @@ function renderWebAppHtml(currentUserEmail?: string): string {
     @supports (-webkit-touch-callout: none) {
       .h-screen-ios { height: -webkit-fill-available; }
     }
+    /* Ensure email reading pane, body, headers, and code snippets can be freely highlighted and copied */
+    #reading-pane, #reading-pane *, #message-detail, #message-detail * {
+      user-select: text !important;
+      -webkit-user-select: text !important;
+    }
   </style>
 </head>
-<body class="bg-slate-50 text-slate-800 h-screen h-screen-ios flex flex-col md:flex-row overflow-hidden select-none">
+<body class="bg-slate-50 text-slate-800 h-screen h-screen-ios flex flex-col md:flex-row overflow-hidden">
 
   <!-- MOBILE TOPBAR -->
   <header class="md:hidden h-14 bg-slate-900 text-white flex items-center justify-between px-3.5 border-b border-slate-800 flex-shrink-0 z-30 shadow-sm">
