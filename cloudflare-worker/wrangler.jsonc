@@ -12,7 +12,14 @@
       "id": "b9e9f6539550499da494013590b3b6ab"
     }
   ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nexus-mail-db",
+      "database_id": "8a8ba96c-142a-4266-99d1-167e14e19dd3"
+    }
+  ],
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": ["*/15 * * * *"]
   }
 }

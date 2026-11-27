@@ -9,13 +9,72 @@ export interface Env {
 }
 
 // User Accounts & Role Permissions
-// Role 'admin': Full access to all accounts (admin@, info@, ayomidebobani@), Spam settings, and Security.
+// Role 'superadmin' / 'admin': Full access to all accounts (admin@, info@, ayomidebobani@), Spam settings, and Security.
 // Role 'member': Restricted strictly to assigned mailboxes (e.g. info@ or personal only, NO access to admin@).
+// Role 'student': Sandboxed strictly to individual student mailbox (e.g. firstname.lastname@devgeeksnexus.com).
 export interface TeamMember {
   email: string;
   name: string;
-  role: 'superadmin' | 'admin' | 'member';
+  role: 'superadmin' | 'admin' | 'member' | 'student';
   allowedAccounts: string[]; // ['*'] for all, or specific email addresses
+}
+
+export interface StudentAccount {
+  id: string;
+  firstName: string;
+  lastName: string;
+  studentEmail: string; // firstname.lastname@devgeeksnexus.com
+  activeEmail: string;  // personal real email (OTP destination)
+  createdAt: string;
+  expiresAt: string | null;
+  status: 'active' | 'suspended';
+}
+
+export async function getStudentAccounts(kv: any): Promise<StudentAccount[]> {
+  if (!kv) return [];
+  try {
+    const list = await kv.get('students:list', 'json');
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    console.error('getStudentAccounts error:', e);
+    return [];
+  }
+}
+
+export async function saveStudentAccounts(kv: any, list: StudentAccount[]): Promise<void> {
+  if (!kv) return;
+  await kv.put('students:list', JSON.stringify(list));
+}
+
+export function sanitizeEmailHandle(str: string): string {
+  return (str || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '')
+    .replace(/^\.+|\.+$/g, '');
+}
+
+export function generateStudentEmail(firstName: string, lastName: string, existingList: StudentAccount[] = []): string {
+  const f = sanitizeEmailHandle(firstName) || 'student';
+  const l = sanitizeEmailHandle(lastName) || 'user';
+  const baseHandle = `${f}.${l}`;
+  let candidate = `${baseHandle}@devgeeksnexus.com`;
+  let counter = 2;
+  const existingEmails = new Set(existingList.map((s) => (s.studentEmail || '').toLowerCase()));
+  while (existingEmails.has(candidate.toLowerCase())) {
+    candidate = `${baseHandle}${counter}@devgeeksnexus.com`;
+    counter++;
+  }
+  return candidate;
+}
+
+export function maskEmail(email: string): string {
+  const parts = (email || '').trim().split('@');
+  if (parts.length !== 2) return email || '';
+  const user = parts[0];
+  const domain = parts[1];
+  if (user.length <= 2) return `${user[0]}*@${domain}`;
+  return `${user.slice(0, 2)}***${user.slice(-1)}@${domain}`;
 }
 
 export const TEAM_MEMBERS: TeamMember[] = [
@@ -45,11 +104,27 @@ export const TEAM_MEMBERS: TeamMember[] = [
   },
 ];
 
-export function resolveUserPermissions(userEmail: string): TeamMember {
+export function resolveUserPermissions(userEmail: string, studentsList: StudentAccount[] = []): TeamMember {
   const normalized = (userEmail || '').trim().toLowerCase();
+
+  // 1. Check Student Accounts
+  const matchedStudent = studentsList.find(
+    (s) => s.studentEmail.toLowerCase() === normalized || s.activeEmail.toLowerCase() === normalized
+  );
+  if (matchedStudent) {
+    return {
+      email: matchedStudent.studentEmail.toLowerCase(),
+      name: `${matchedStudent.firstName} ${matchedStudent.lastName}`.trim(),
+      role: 'student',
+      allowedAccounts: [matchedStudent.studentEmail.toLowerCase()],
+    };
+  }
+
+  // 2. Check Static Team Members
   const matched = TEAM_MEMBERS.find((m) => m.email.toLowerCase() === normalized);
   if (matched) return matched;
-  // Default fallback for any newly verified @devgeeksnexus.com staff: member with access to info only
+
+  // 3. Default fallback for any newly verified @devgeeksnexus.com staff: member with access to info only
   return {
     email: normalized,
     name: normalized.split('@')[0],
@@ -543,31 +618,75 @@ export default {
         const body = (await request.json()) as any;
         const email = (body.email || '').trim().toLowerCase();
 
-        // Default allowed email or organization emails
-        const isAuthorized =
-          email === 'ayomidebobani@gmail.com' ||
-          email.endsWith('@devgeeksnexus.com');
+        // Check if matching a registered student account
+        const studentsList = await getStudentAccounts(env.EMAILS);
+        const matchedStudent = studentsList.find(
+          (s) => s.studentEmail.toLowerCase() === email || s.activeEmail.toLowerCase() === email
+        );
 
-        if (!email || !isAuthorized) {
-          return new Response(
-            JSON.stringify({ error: 'Unauthorized email address. Only admin and authorized personnel are permitted.' }),
-            { status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
-          );
+        let targetSendEmail = email;
+        let resolvedSessionEmail = email;
+        let isStudent = false;
+
+        if (matchedStudent) {
+          if (matchedStudent.status === 'suspended') {
+            return new Response(
+              JSON.stringify({ error: 'Your student mailbox has been suspended. Please contact the administrator.' }),
+              { status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
+            );
+          }
+          if (matchedStudent.expiresAt && new Date(matchedStudent.expiresAt).getTime() < Date.now()) {
+            return new Response(
+              JSON.stringify({ error: 'Your student temporary mailbox has expired. Please contact the administrator.' }),
+              { status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
+            );
+          }
+          isStudent = true;
+          targetSendEmail = matchedStudent.activeEmail; // send to real active personal email!
+          resolvedSessionEmail = matchedStudent.studentEmail; // session is for student's @devgeeksnexus.com mailbox
+        } else {
+          // Check standard staff / admin
+          const isAuthorized =
+            email === 'ayomidebobani@gmail.com' ||
+            email.endsWith('@devgeeksnexus.com');
+
+          if (!email || !isAuthorized) {
+            return new Response(
+              JSON.stringify({ error: 'Unauthorized email address. Only admin and authorized personnel are permitted.' }),
+              { status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
+            );
+          }
         }
 
         // Generate a 6-digit OTP
         const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
 
         if (env.EMAILS) {
-          // Store OTP in Cloudflare KV with 10-minute expiration (600 seconds)
-          await env.EMAILS.put(`otp:${email}`, JSON.stringify({ code: otpCode, timestamp: Date.now() }), {
-            expirationTtl: 600,
-          });
+          const otpPayload = {
+            code: otpCode,
+            timestamp: Date.now(),
+            resolvedEmail: resolvedSessionEmail,
+            isStudent,
+          };
+          // Store OTP in Cloudflare KV under both login email and student addresses with 10-minute expiration
+          await env.EMAILS.put(`otp:${email}`, JSON.stringify(otpPayload), { expirationTtl: 600 });
+          if (isStudent && matchedStudent) {
+            await env.EMAILS.put(`otp:${matchedStudent.studentEmail.toLowerCase()}`, JSON.stringify(otpPayload), { expirationTtl: 600 });
+            await env.EMAILS.put(`otp:${matchedStudent.activeEmail.toLowerCase()}`, JSON.stringify(otpPayload), { expirationTtl: 600 });
+          }
         }
 
         // Send OTP directly via Resend to the user's destination email
         const resendKey = (env.RESEND_API_KEY || (env as any).SMTP_PASS || '').trim();
         if (resendKey) {
+          const emailSubject = isStudent
+            ? `${otpCode} is your DevGeeksNexus Student Mail Verification Code`
+            : `${otpCode} is your DevGeeksNexus Webmail Login Code`;
+          const emailBodyTitle = isStudent ? 'Student Mailbox Verification' : 'DevGeeksNexus Webmail';
+          const emailBodySub = isStudent
+            ? `Single-use code to access <strong>${resolvedSessionEmail}</strong>`
+            : 'Identity Verification & Secure Sign-In';
+
           const resendResponse = await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: {
@@ -576,14 +695,14 @@ export default {
             },
             body: JSON.stringify({
               from: 'DevGeeksNexus Security <info@devgeeksnexus.com>',
-              to: [email],
-              subject: `${otpCode} is your DevGeeksNexus Webmail Login Code`,
+              to: [targetSendEmail],
+              subject: emailSubject,
               html: `
                 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 32px 24px; background: #0f172a; border-radius: 16px; color: #f8fafc; border: 1px solid #1e293b;">
                   <div style="text-align: center; margin-bottom: 24px;">
                     <div style="display: inline-block; width: 48px; height: 48px; line-height: 48px; border-radius: 12px; background: linear-gradient(135deg, #4f46e5, #0ea5e9); color: #ffffff; font-weight: bold; font-size: 22px;">N</div>
-                    <h2 style="font-size: 20px; font-weight: 700; color: #ffffff; margin-top: 12px; margin-bottom: 4px;">DevGeeksNexus Webmail</h2>
-                    <p style="font-size: 13px; color: #94a3b8; margin: 0;">Identity Verification & Secure Sign-In</p>
+                    <h2 style="font-size: 20px; font-weight: 700; color: #ffffff; margin-top: 12px; margin-bottom: 4px;">${emailBodyTitle}</h2>
+                    <p style="font-size: 13px; color: #94a3b8; margin: 0;">${emailBodySub}</p>
                   </div>
                   <div style="background: #1e293b; border-radius: 12px; padding: 24px; text-align: center; border: 1px solid #334155;">
                     <p style="font-size: 14px; color: #cbd5e1; margin-top: 0; margin-bottom: 16px;">Here is your single-use verification code to log in to your mailbox:</p>
@@ -611,8 +730,14 @@ export default {
           console.warn('RESEND_API_KEY missing, unable to send OTP email.');
         }
 
+        const maskedTarget = maskEmail(targetSendEmail);
         return new Response(
-          JSON.stringify({ success: true, message: `OTP verification code sent to ${email}` }),
+          JSON.stringify({
+            success: true,
+            isStudent,
+            sentTo: maskedTarget,
+            message: `OTP verification code sent to ${maskedTarget}`,
+          }),
           { headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
         );
       } catch (err: any) {
@@ -656,10 +781,14 @@ export default {
         // OTP is valid! Delete used OTP
         await env.EMAILS.delete(`otp:${email}`);
 
+        // Resolve authenticated session email (for students, their student @devgeeksnexus.com address)
+        const sessionEmail = storedOtp.resolvedEmail || email;
+
         // Generate 24-hour session token
         const newSessionToken = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
         const sessionPayload = {
-          email,
+          email: sessionEmail,
+          isStudent: !!storedOtp.isStudent,
           createdAt: Date.now(),
         };
 
@@ -670,7 +799,7 @@ export default {
 
         const setCookieHeader = `nexus_session=${newSessionToken}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure`;
 
-        return new Response(JSON.stringify({ success: true, email }), {
+        return new Response(JSON.stringify({ success: true, email: sessionEmail }), {
           headers: {
             ...CORS_HEADERS,
             'Content-Type': 'application/json',
@@ -720,13 +849,24 @@ export default {
     }
 
     // Resolve User Role & Permitted Mailbox Accounts
-    const userPerms = resolveUserPermissions(authEmail);
+    const studentsList = await getStudentAccounts(env.EMAILS);
+    const userPerms = resolveUserPermissions(authEmail, studentsList);
     const hasFullAccess = userPerms.allowedAccounts.includes('*');
 
     // Filter accounts visible to this user
-    const userAccessibleAccounts = KNOWN_ACCOUNTS.filter(
+    let userAccessibleAccounts = KNOWN_ACCOUNTS.filter(
       acc => hasFullAccess || userPerms.allowedAccounts.includes(acc.email.toLowerCase())
     );
+    if (userPerms.role === 'student') {
+      userAccessibleAccounts = [{
+        email: userPerms.email,
+        name: userPerms.name,
+        label: 'Student Mailbox',
+        role: 'Temporary Student Account',
+        color: 'sky',
+        avatar: (userPerms.name[0] || 'S').toUpperCase(),
+      }];
+    }
 
     // SECURITY & ADMIN API: GET & POST /api/admin/security-settings
     if (url.pathname === '/api/admin/security-settings') {
@@ -763,6 +903,149 @@ export default {
       return new Response(JSON.stringify({ settings: secSettings, team: TEAM_MEMBERS, user: userPerms }), {
         headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
+    }
+
+    // STUDENT MANAGEMENT API: GET, POST, PUT, DELETE /api/admin/students
+    if (url.pathname === '/api/admin/students') {
+      if (userPerms.role !== 'superadmin' && userPerms.role !== 'admin') {
+        return new Response(JSON.stringify({ error: 'Permission denied. Super Admin or Admin role required.' }), {
+          status: 403,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // GET: List all students
+      if (request.method === 'GET') {
+        return new Response(JSON.stringify({ students: studentsList }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // POST: Create student
+      if (request.method === 'POST') {
+        try {
+          const body = (await request.json()) as any;
+          const firstName = (body.firstName || '').trim();
+          const lastName = (body.lastName || '').trim();
+          const activeEmail = (body.activeEmail || '').trim().toLowerCase();
+          const validityDays = body.validityDays !== undefined ? Number(body.validityDays) : 30;
+          const status = body.status === 'suspended' ? 'suspended' : 'active';
+
+          if (!firstName || !lastName || !activeEmail) {
+            return new Response(JSON.stringify({ error: 'First name, last name, and active personal email are required.' }), {
+              status: 400,
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+
+          if (!activeEmail.includes('@') || !activeEmail.includes('.')) {
+            return new Response(JSON.stringify({ error: 'Please provide a valid active email address.' }), {
+              status: 400,
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+
+          const studentEmail = generateStudentEmail(firstName, lastName, studentsList);
+          let expiresAt: string | null = null;
+          if (validityDays > 0) {
+            expiresAt = new Date(Date.now() + validityDays * 86400000).toISOString();
+          }
+
+          const newStudent: StudentAccount = {
+            id: `stud_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+            firstName,
+            lastName,
+            studentEmail,
+            activeEmail,
+            createdAt: new Date().toISOString(),
+            expiresAt,
+            status,
+          };
+
+          studentsList.unshift(newStudent);
+          await saveStudentAccounts(env.EMAILS, studentsList);
+
+          return new Response(JSON.stringify({ success: true, student: newStudent }), {
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        } catch (err: any) {
+          return new Response(JSON.stringify({ error: err.message || 'Failed to create student account.' }), {
+            status: 500,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // PUT: Edit student
+      if (request.method === 'PUT') {
+        try {
+          const body = (await request.json()) as any;
+          const id = body.id;
+          const student = studentsList.find((s) => s.id === id);
+          if (!student) {
+            return new Response(JSON.stringify({ error: 'Student account not found.' }), {
+              status: 404,
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+
+          if (body.firstName) student.firstName = body.firstName.trim();
+          if (body.lastName) student.lastName = body.lastName.trim();
+          if (body.activeEmail) student.activeEmail = body.activeEmail.trim().toLowerCase();
+          if (body.status) student.status = body.status === 'suspended' ? 'suspended' : 'active';
+
+          if (body.validityDays !== undefined) {
+            const days = Number(body.validityDays);
+            if (days > 0) {
+              student.expiresAt = new Date(Date.now() + days * 86400000).toISOString();
+            } else if (days === -1) {
+              student.expiresAt = null;
+            }
+          } else if (body.expiresAt !== undefined) {
+            student.expiresAt = body.expiresAt;
+          }
+
+          await saveStudentAccounts(env.EMAILS, studentsList);
+
+          return new Response(JSON.stringify({ success: true, student }), {
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        } catch (err: any) {
+          return new Response(JSON.stringify({ error: err.message || 'Failed to update student account.' }), {
+            status: 500,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // DELETE: Delete student
+      if (request.method === 'DELETE') {
+        try {
+          let id = url.searchParams.get('id');
+          if (!id) {
+            const body = (await request.json().catch(() => ({}))) as any;
+            id = body.id;
+          }
+          if (!id) {
+            return new Response(JSON.stringify({ error: 'Student ID is required.' }), {
+              status: 400,
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+
+          const filtered = studentsList.filter((s) => s.id !== id);
+          await saveStudentAccounts(env.EMAILS, filtered);
+
+          return new Response(JSON.stringify({ success: true }), {
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        } catch (err: any) {
+          return new Response(JSON.stringify({ error: err.message || 'Failed to delete student account.' }), {
+            status: 500,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+      }
     }
 
     // API: GET /api/messages
@@ -894,15 +1177,21 @@ export default {
 
         let senderEmail = 'info@devgeeksnexus.com';
         let senderDisplayName = 'DevGeeksNexus Team';
-        const matchedAccount = KNOWN_ACCOUNTS.find(
-          (acc) => acc.email.toLowerCase() === (from || '').trim().toLowerCase()
-        );
-        if (matchedAccount) {
-          senderEmail = matchedAccount.email;
-          senderDisplayName = matchedAccount.name;
-        } else if (from && from.toLowerCase().endsWith('@devgeeksnexus.com')) {
-          senderEmail = from.trim().toLowerCase();
-          senderDisplayName = senderEmail.split('@')[0];
+
+        if (userPerms.role === 'student') {
+          senderEmail = userPerms.email.toLowerCase();
+          senderDisplayName = userPerms.name;
+        } else {
+          const matchedAccount = KNOWN_ACCOUNTS.find(
+            (acc) => acc.email.toLowerCase() === (from || '').trim().toLowerCase()
+          );
+          if (matchedAccount) {
+            senderEmail = matchedAccount.email;
+            senderDisplayName = matchedAccount.name;
+          } else if (from && from.toLowerCase().endsWith('@devgeeksnexus.com')) {
+            senderEmail = from.trim().toLowerCase();
+            senderDisplayName = senderEmail.split('@')[0];
+          }
         }
 
         const draftId = id || `draft_${Date.now()}_${Math.random().toString(36).substring(7)}`;
@@ -971,16 +1260,28 @@ export default {
         let senderEmail = 'info@devgeeksnexus.com';
         let senderDisplayName = 'DevGeeksNexus Team';
 
-        const matchedAccount = KNOWN_ACCOUNTS.find(
-          (acc) => acc.email.toLowerCase() === (from || '').trim().toLowerCase()
-        );
+        if (userPerms.role === 'student') {
+          // Strict sandboxing: student can only send from their assigned student email
+          if (from && from.trim().toLowerCase() !== userPerms.email.toLowerCase()) {
+            return new Response(JSON.stringify({ error: 'Permission denied. Students can only send from their assigned student address.' }), {
+              status: 403,
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+          senderEmail = userPerms.email.toLowerCase();
+          senderDisplayName = userPerms.name;
+        } else {
+          const matchedAccount = KNOWN_ACCOUNTS.find(
+            (acc) => acc.email.toLowerCase() === (from || '').trim().toLowerCase()
+          );
 
-        if (matchedAccount) {
-          senderEmail = matchedAccount.email;
-          senderDisplayName = matchedAccount.name;
-        } else if (from && from.toLowerCase().endsWith('@devgeeksnexus.com')) {
-          senderEmail = from.trim().toLowerCase();
-          senderDisplayName = senderEmail.split('@')[0];
+          if (matchedAccount) {
+            senderEmail = matchedAccount.email;
+            senderDisplayName = matchedAccount.name;
+          } else if (from && from.toLowerCase().endsWith('@devgeeksnexus.com')) {
+            senderEmail = from.trim().toLowerCase();
+            senderDisplayName = senderEmail.split('@')[0];
+          }
         }
 
         // Generate tracking ID if tracking is enabled
@@ -1296,7 +1597,8 @@ export default {
     }
 
     // Default: Serve the complete Nexus Suite for Authenticated User
-    return new Response(renderWebAppHtml(authEmail), {
+    const currentStudent = studentsList.find(s => s.studentEmail.toLowerCase() === authEmail.toLowerCase());
+    return new Response(renderWebAppHtml(authEmail, currentStudent), {
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
@@ -1306,7 +1608,11 @@ export default {
   },
 };
 
-function renderWebAppHtml(currentUserEmail?: string): string {
+function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAccount | null): string {
+  const isStudent = !!currentStudent;
+  const studentEmail = currentStudent ? currentStudent.studentEmail : '';
+  const studentInitial = currentStudent && currentStudent.firstName ? currentStudent.firstName[0].toUpperCase() : 'S';
+  const studentDisplayName = currentStudent ? `${currentStudent.firstName} ${currentStudent.lastName}`.trim() : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1368,10 +1674,16 @@ function renderWebAppHtml(currentUserEmail?: string): string {
     body.theme-dark #dns-view .bg-white, body.theme-dark #security-view .bg-white { background-color: #0f172a !important; border-color: #1e293b !important; color: #f8fafc !important; }
     body.theme-dark #dns-view .text-slate-900, body.theme-dark #security-view .text-slate-900 { color: #f8fafc !important; }
     body.theme-dark #security-view textarea { background-color: #1e293b !important; border-color: #334155 !important; color: #f8fafc !important; }
+    body.theme-dark #security-view input, body.theme-dark #security-view select { background-color: #1e293b !important; border-color: #334155 !important; color: #f8fafc !important; }
     body.theme-dark #security-view table tr { border-color: #1e293b !important; }
     body.theme-dark #security-view table th { color: #94a3b8 !important; }
     body.theme-dark #security-view table td { color: #cbd5e1 !important; }
     body.theme-dark #security-view table tr:hover { background-color: #1e293b/50 !important; }
+    body.theme-dark #student-modal .bg-white { background-color: #0f172a !important; border-color: #1e293b !important; color: #f8fafc !important; }
+    body.theme-dark #student-modal .bg-slate-50\/50 { background-color: #1e293b !important; border-color: #334155 !important; }
+    body.theme-dark #student-modal input, body.theme-dark #student-modal select { background-color: #020617 !important; border-color: #334155 !important; color: #f8fafc !important; }
+    body.theme-dark #student-modal label { color: #cbd5e1 !important; }
+    body.theme-dark #student-modal .text-slate-900 { color: #f8fafc !important; }
   </style>
 </head>
 <body class="bg-slate-50 text-slate-800 h-screen h-screen-ios flex flex-col md:flex-row overflow-hidden">
@@ -1435,6 +1747,21 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       </div>
 
       <div class="space-y-1">
+        ${isStudent ? `
+        <!-- Student Mailbox -->
+        <button onclick="switchAccount('${studentEmail}')" id="acc-student" class="w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all bg-sky-600/20 text-sky-300 border border-sky-500/30">
+          <div class="flex items-center space-x-2.5 truncate">
+            <div class="w-6 h-6 rounded-md bg-sky-900/60 text-sky-300 border border-sky-700/40 flex items-center justify-center text-[11px] font-bold">
+              ${studentInitial}
+            </div>
+            <div class="text-left truncate">
+              <div class="text-xs font-semibold leading-tight text-white">${studentDisplayName}</div>
+              <div class="text-[10px] text-slate-400 truncate font-mono">${studentEmail}</div>
+            </div>
+          </div>
+          <span id="badge-acc-student" class="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
+        </button>
+        ` : `
         <!-- All Mailboxes -->
         <button onclick="switchAccount('all')" id="acc-all" class="w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all bg-indigo-600/20 text-indigo-300 border border-indigo-500/30">
           <div class="flex items-center space-x-2.5 truncate">
@@ -1490,6 +1817,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
           </div>
           <span id="badge-acc-admin" class="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-300 font-mono">0</span>
         </button>
+        `}
       </div>
     </div>
 
@@ -1552,6 +1880,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         <span class="px-1.5 py-0.2 rounded text-[9px] bg-rose-950 text-rose-300 border border-rose-800/60 font-semibold uppercase">Live</span>
       </button>
 
+      ${!isStudent ? `
       <!-- Security & Administration (Roles, Spam blocklist, allowlist) -->
       <button onclick="switchTab('security')" id="btn-security" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
         <div class="flex items-center space-x-3">
@@ -1569,6 +1898,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         </div>
         <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
       </button>
+      ` : ''}
 
       <div class="pt-2 pb-1 px-3">
         <div class="border-t border-slate-800"></div>
@@ -2005,6 +2335,63 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         <button onclick="switchTab('mail')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg active:scale-95 transition-all">Back to Mailbox</button>
       </div>
 
+      <!-- Student Temporary Mailboxes Governance -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5 shadow-sm space-y-4">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-slate-100 pb-4">
+          <div class="flex items-center space-x-3">
+            <div class="w-9 h-9 rounded-lg bg-sky-50 text-sky-600 flex items-center justify-center text-base font-semibold">
+              <i class="fa-solid fa-graduation-cap"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="font-bold text-sm text-slate-900">Student Temporary Mailboxes</h3>
+                <span class="px-2 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-700 uppercase">Super Admin</span>
+              </div>
+              <p class="text-xs text-slate-500">Create, edit, and manage isolated @devgeeksnexus.com mailboxes for students with OTP forwarded to their active emails.</p>
+            </div>
+          </div>
+          <button onclick="openCreateStudentModal()" class="px-3.5 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold rounded-lg shadow-sm active:scale-95 transition-all flex items-center justify-center space-x-1.5 flex-shrink-0">
+            <i class="fa-solid fa-user-plus text-xs"></i>
+            <span>Create Student Mailbox</span>
+          </button>
+        </div>
+
+        <!-- Filter bar -->
+        <div class="flex items-center justify-between gap-3">
+          <div class="relative flex-1 max-w-sm">
+            <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400 pointer-events-none">
+              <i class="fa-solid fa-magnifying-glass text-xs"></i>
+            </span>
+            <input type="text" id="student-search-input" oninput="filterStudents()" placeholder="Search students by name or email..." class="w-full pl-9 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-sky-500" />
+          </div>
+          <div class="flex items-center space-x-2 text-xs text-slate-500">
+            <span>Total: <strong id="student-total-count" class="font-mono text-slate-800">0</strong></span>
+          </div>
+        </div>
+
+        <!-- Students Table -->
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-xs">
+            <thead>
+              <tr class="border-b border-slate-100 text-slate-400 uppercase tracking-wider font-semibold">
+                <th class="py-2.5 px-3">Student Name</th>
+                <th class="py-2.5 px-3">Temporary Email</th>
+                <th class="py-2.5 px-3">Active (Personal) Email</th>
+                <th class="py-2.5 px-3">Expires</th>
+                <th class="py-2.5 px-3">Status</th>
+                <th class="py-2.5 px-3 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="student-members-table-body" class="divide-y divide-slate-100">
+              <tr>
+                <td colspan="6" class="py-6 text-center text-slate-400">Loading student accounts...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-[11px] text-slate-500 italic"><i class="fa-solid fa-shield-halved mr-1 text-sky-500"></i> Students are strictly sandboxed to their own temporary mailbox with zero visibility of info@ or admin@ mailboxes, and can log in via OTP sent to their active personal email.</p>
+      </div>
+
       <!-- Team Role Management Table -->
       <div class="bg-white rounded-xl border border-slate-200 p-5 shadow-sm space-y-4">
         <div class="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -2097,6 +2484,92 @@ function renderWebAppHtml(currentUserEmail?: string): string {
     </div>
   </div>
 
+  <!-- CREATE / EDIT STUDENT MODAL -->
+  <div id="student-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm">
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+      <!-- Header -->
+      <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+        <div class="flex items-center space-x-2.5">
+          <div class="w-8 h-8 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center font-bold text-sm">
+            <i class="fa-solid fa-user-graduate"></i>
+          </div>
+          <div>
+            <h3 id="student-modal-title" class="font-bold text-sm text-slate-900">Create Student Mailbox</h3>
+            <p class="text-[11px] text-slate-500">Assign temporary @devgeeksnexus.com email and active OTP destination</p>
+          </div>
+        </div>
+        <button onclick="closeStudentModal()" class="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <!-- Form Body -->
+      <form id="student-form" onsubmit="saveStudentModal(event)" class="p-5 space-y-4 overflow-y-auto">
+        <input type="hidden" id="student-id" value="" />
+        
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-semibold text-slate-700 mb-1">First Name *</label>
+            <input type="text" id="student-firstname" oninput="updateStudentEmailPreview()" required placeholder="e.g. John" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-sky-500" />
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-700 mb-1">Last Name *</label>
+            <input type="text" id="student-lastname" oninput="updateStudentEmailPreview()" required placeholder="e.g. Doe" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-sky-500" />
+          </div>
+        </div>
+
+        <!-- Generated Mailbox Address Preview -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Assigned Temporary Mailbox</label>
+          <div class="p-2.5 bg-slate-900 rounded-lg border border-slate-800 flex items-center justify-between text-xs font-mono text-sky-400">
+            <span id="student-email-preview">firstname.lastname@devgeeksnexus.com</span>
+            <span class="text-[10px] text-slate-400 font-sans px-1.5 py-0.5 rounded bg-slate-800">Auto-Generated</span>
+          </div>
+        </div>
+
+        <!-- Active (Personal) Email -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Active Email Address (Personal / Real) *</label>
+          <input type="email" id="student-active-email" required placeholder="e.g. student@gmail.com" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-sky-500" />
+          <p class="text-[11px] text-slate-500 mt-1">The student can enter this email at login to receive their 6-digit OTP code.</p>
+        </div>
+
+        <!-- Expiration & Status -->
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-semibold text-slate-700 mb-1">Mailbox Validity</label>
+            <select id="student-validity" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-sky-500">
+              <option value="30">30 Days</option>
+              <option value="60">60 Days</option>
+              <option value="90">90 Days</option>
+              <option value="180">180 Days (6 Months)</option>
+              <option value="365">1 Year</option>
+              <option value="-1">No Expiration (Permanent)</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-700 mb-1">Account Status</label>
+            <select id="student-status" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-sky-500">
+              <option value="active">Active</option>
+              <option value="suspended">Suspended</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="student-modal-error" class="hidden p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-600 text-xs"></div>
+
+        <!-- Footer Actions -->
+        <div class="pt-3 border-t border-slate-100 flex items-center justify-end space-x-2">
+          <button type="button" onclick="closeStudentModal()" class="px-3.5 py-2 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors">Cancel</button>
+          <button type="submit" id="btn-save-student" class="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow-sm active:scale-95 transition-all flex items-center space-x-1.5">
+            <i class="fa-solid fa-check"></i>
+            <span id="btn-save-student-text">Save Student Mailbox</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- COMPOSE MODAL (WITH DRAFT SAVING SUPPORT) -->
   <div id="compose-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4 z-50 transition-all">
     <div class="bg-white rounded-t-2xl sm:rounded-xl shadow-2xl border border-slate-200 w-full sm:max-w-2xl max-h-[92vh] sm:max-h-[85vh] h-[88vh] sm:h-auto overflow-hidden flex flex-col animate-in slide-in-from-bottom sm:slide-in-from-bottom-0 sm:fade-in sm:zoom-in-95 duration-200">
@@ -2127,9 +2600,13 @@ function renderWebAppHtml(currentUserEmail?: string): string {
             <label class="w-12 sm:w-14 font-semibold text-slate-500 text-right flex-shrink-0">From:</label>
             <div class="flex-1 relative">
               <select id="compose-from" class="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 text-slate-800 bg-white font-medium cursor-pointer">
+                ${isStudent ? `
+                <option value="${studentEmail}">${studentDisplayName} &lt;${studentEmail}&gt;</option>
+                ` : `
                 <option value="info@devgeeksnexus.com">DevGeeksNexus Team &lt;info@devgeeksnexus.com&gt;</option>
                 <option value="ayomidebobani@devgeeksnexus.com">Ayomide Bobani &lt;ayomidebobani@devgeeksnexus.com&gt;</option>
                 <option value="admin@devgeeksnexus.com">Admin | DevGeeksNexus &lt;admin@devgeeksnexus.com&gt;</option>
+                `}
               </select>
             </div>
             <span class="hidden sm:flex text-[11px] text-emerald-600 font-medium items-center space-x-1">
@@ -2284,7 +2761,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
   <script>
     let allMessages = [];
     let currentFolder = 'inbox';
-    let currentAccount = 'all'; // 'all' | 'info@devgeeksnexus.com' | 'ayomidebobani@devgeeksnexus.com' | 'admin@devgeeksnexus.com'
+    let currentAccount = ${isStudent ? `'${studentEmail}'` : `'all'`}; // 'all' | individual mailbox
     let selectedMsg = null;
     let attachedFiles = [];
     let currentDraftId = null;
@@ -2343,21 +2820,27 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       const ayoUnread = stats['ayomidebobani@devgeeksnexus.com'] ? stats['ayomidebobani@devgeeksnexus.com'].unread : 0;
       const adminUnread = stats['admin@devgeeksnexus.com'] ? stats['admin@devgeeksnexus.com'].unread : 0;
 
-      document.getElementById('badge-acc-all').textContent = allUnread;
-      document.getElementById('badge-acc-info').textContent = infoUnread;
-      document.getElementById('badge-acc-ayomide').textContent = ayoUnread;
-      document.getElementById('badge-acc-admin').textContent = adminUnread;
+      const bAll = document.getElementById('badge-acc-all'); if (bAll) bAll.textContent = allUnread;
+      const bInfo = document.getElementById('badge-acc-info'); if (bInfo) bInfo.textContent = infoUnread;
+      const bAyo = document.getElementById('badge-acc-ayomide'); if (bAyo) bAyo.textContent = ayoUnread;
+      const bAdmin = document.getElementById('badge-acc-admin'); if (bAdmin) bAdmin.textContent = adminUnread;
+      const bStudent = document.getElementById('badge-acc-student');
+      if (bStudent && stats[currentAccount.toLowerCase()]) {
+        bStudent.textContent = stats[currentAccount.toLowerCase()].unread || 0;
+      }
 
       if (currentAccount === 'all') {
-        document.getElementById('unread-count').textContent = allUnread;
+        const unreadEl = document.getElementById('unread-count');
+        if (unreadEl) unreadEl.textContent = allUnread;
       } else if (stats[currentAccount.toLowerCase()]) {
-        document.getElementById('unread-count').textContent = stats[currentAccount.toLowerCase()].unread;
+        const unreadEl = document.getElementById('unread-count');
+        if (unreadEl) unreadEl.textContent = stats[currentAccount.toLowerCase()].unread;
       }
 
       // Update folder counts
       if (folderCounts) {
-        document.getElementById('drafts-count').textContent = folderCounts.drafts || 0;
-        document.getElementById('sent-count').textContent = folderCounts.sent || 0;
+        const dEl = document.getElementById('drafts-count'); if (dEl) dEl.textContent = folderCounts.drafts || 0;
+        const sEl = document.getElementById('sent-count'); if (sEl) sEl.textContent = folderCounts.sent || 0;
         const spamEl = document.getElementById('spam-count');
         if (spamEl) spamEl.textContent = folderCounts.spam || 0;
       }
@@ -2371,14 +2854,18 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         { id: 'acc-info', target: 'info@devgeeksnexus.com', label: 'Info Desk' },
         { id: 'acc-ayomide', target: 'ayomidebobani@devgeeksnexus.com', label: 'Ayomide Bobani' },
         { id: 'acc-admin', target: 'admin@devgeeksnexus.com', label: 'Admin' },
+        { id: 'acc-student', target: '${studentEmail}', label: '${studentDisplayName || "Student Mailbox"}' },
       ];
 
       buttons.forEach(b => {
         const el = document.getElementById(b.id);
+        if (!el) return;
         if (b.target === acc) {
-          el.className = 'w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all bg-indigo-600/20 text-indigo-300 border border-indigo-500/30';
-          document.getElementById('current-acc-label').textContent = b.label;
-          document.getElementById('mobile-top-account').textContent = b.label;
+          el.className = 'w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all bg-sky-600/20 text-sky-300 border border-sky-500/30';
+          const curLbl = document.getElementById('current-acc-label');
+          if (curLbl) curLbl.textContent = b.label;
+          const mobLbl = document.getElementById('mobile-top-account');
+          if (mobLbl) mobLbl.textContent = b.label;
         } else {
           el.className = 'w-full flex items-center justify-between p-2 rounded-lg text-xs font-medium transition-all text-slate-300 hover:bg-slate-800/80 border border-transparent';
         }
@@ -2795,8 +3282,9 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         
         // Populate Team Member Roster
         const tbody = document.getElementById('team-members-table-body');
-        if (tbody && data.teamMembers) {
-          tbody.innerHTML = data.teamMembers.map(m => {
+        const teamList = data.team || data.teamMembers || [];
+        if (tbody && teamList.length > 0) {
+          tbody.innerHTML = teamList.map(m => {
             const roleBadge = m.role === 'superadmin' 
               ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-700">Superadmin</span>'
               : m.role === 'admin'
@@ -2861,6 +3349,180 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         alert('Network error while saving security rules');
       } finally {
         if (btn) btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> <span>Save Security Rules</span>';
+      }
+    }
+
+    // STUDENT TEMPORARY MAILBOX MANAGEMENT
+    let allStudents = [];
+
+    async function loadStudentAccounts() {
+      const tbody = document.getElementById('student-members-table-body');
+      if (!tbody) return;
+      try {
+        const res = await fetch('/api/admin/students');
+        if (!res.ok) return;
+        const data = await res.json();
+        allStudents = data.students || [];
+        renderStudentTable(allStudents);
+      } catch (e) {
+        console.error('Error loading student accounts:', e);
+      }
+    }
+
+    function renderStudentTable(students) {
+      const tbody = document.getElementById('student-members-table-body');
+      const countEl = document.getElementById('student-total-count');
+      if (countEl) countEl.textContent = students ? students.length : 0;
+      if (!tbody) return;
+
+      if (!students || students.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="py-6 text-center text-slate-400 text-xs">No student mailboxes created yet. Click "Create Student Mailbox" above.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = students.map(s => {
+        let statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-700">Active</span>';
+        if (s.status === 'suspended') {
+          statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-700">Suspended</span>';
+        } else if (s.expiresAt && new Date(s.expiresAt).getTime() < Date.now()) {
+          statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700">Expired</span>';
+        }
+
+        let expiryDisplay = '<span class="text-slate-400 font-medium">Permanent</span>';
+        if (s.expiresAt) {
+          const expDate = new Date(s.expiresAt);
+          const daysLeft = Math.ceil((expDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+          if (daysLeft > 0) {
+            expiryDisplay = '<span class="font-mono text-slate-700">' + expDate.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + '</span> <span class="text-[10px] text-indigo-600 font-semibold">(' + daysLeft + 'd left)</span>';
+          } else {
+            expiryDisplay = '<span class="text-rose-600 font-semibold">Expired</span>';
+          }
+        }
+
+        return '<tr class="hover:bg-slate-50/50 transition-colors">' +
+          '<td class="py-2.5 px-3 font-semibold text-slate-900">' + s.firstName + ' ' + s.lastName + '</td>' +
+          '<td class="py-2.5 px-3 font-mono text-sky-700 font-medium">' + s.studentEmail + '</td>' +
+          '<td class="py-2.5 px-3 font-mono text-slate-600">' + s.activeEmail + '</td>' +
+          '<td class="py-2.5 px-3">' + expiryDisplay + '</td>' +
+          '<td class="py-2.5 px-3">' + statusBadge + '</td>' +
+          '<td class="py-2.5 px-3 text-right space-x-1 whitespace-nowrap">' +
+            '<button data-id="' + s.id + '" onclick="openEditStudentModal(this.dataset.id)" class="p-1.5 text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 rounded transition-colors" title="Edit Student Mailbox"><i class="fa-solid fa-pen-to-square"></i></button>' +
+            '<button data-id="' + s.id + '" data-name="' + encodeURIComponent(s.firstName + ' ' + s.lastName) + '" onclick="deleteStudentAccount(this.dataset.id, decodeURIComponent(this.dataset.name))" class="p-1.5 text-rose-600 hover:text-rose-800 hover:bg-rose-50 rounded transition-colors" title="Delete Student Mailbox"><i class="fa-solid fa-trash-can"></i></button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    function filterStudents() {
+      const q = (document.getElementById('student-search-input').value || '').trim().toLowerCase();
+      if (!q) {
+        renderStudentTable(allStudents);
+        return;
+      }
+      const filtered = allStudents.filter(s => 
+        (s.firstName + ' ' + s.lastName).toLowerCase().includes(q) ||
+        (s.studentEmail || '').toLowerCase().includes(q) ||
+        (s.activeEmail || '').toLowerCase().includes(q)
+      );
+      renderStudentTable(filtered);
+    }
+
+    function openCreateStudentModal() {
+      document.getElementById('student-modal-title').textContent = 'Create Student Mailbox';
+      document.getElementById('btn-save-student-text').textContent = 'Create Student Mailbox';
+      document.getElementById('student-id').value = '';
+      document.getElementById('student-firstname').value = '';
+      document.getElementById('student-lastname').value = '';
+      document.getElementById('student-active-email').value = '';
+      document.getElementById('student-validity').value = '30';
+      document.getElementById('student-status').value = 'active';
+      document.getElementById('student-email-preview').textContent = 'firstname.lastname@devgeeksnexus.com';
+      document.getElementById('student-modal-error').classList.add('hidden');
+      document.getElementById('student-modal').classList.remove('hidden');
+    }
+
+    function openEditStudentModal(id) {
+      const student = allStudents.find(s => s.id === id);
+      if (!student) return;
+      document.getElementById('student-modal-title').textContent = 'Edit Student Mailbox';
+      document.getElementById('btn-save-student-text').textContent = 'Save Changes';
+      document.getElementById('student-id').value = student.id;
+      document.getElementById('student-firstname').value = student.firstName;
+      document.getElementById('student-lastname').value = student.lastName;
+      document.getElementById('student-active-email').value = student.activeEmail;
+      document.getElementById('student-status').value = student.status || 'active';
+      document.getElementById('student-email-preview').textContent = student.studentEmail;
+      document.getElementById('student-validity').value = '30';
+      document.getElementById('student-modal-error').classList.add('hidden');
+      document.getElementById('student-modal').classList.remove('hidden');
+    }
+
+    function closeStudentModal() {
+      document.getElementById('student-modal').classList.add('hidden');
+    }
+
+    function updateStudentEmailPreview() {
+      const editId = document.getElementById('student-id').value;
+      if (editId) return; // Keep existing assigned mailbox address when editing
+      const f = (document.getElementById('student-firstname').value || '').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+      const l = (document.getElementById('student-lastname').value || '').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+      const handle = (f && l) ? (f + '.' + l) : (f || l || 'firstname.lastname');
+      document.getElementById('student-email-preview').textContent = handle + '@devgeeksnexus.com';
+    }
+
+    async function saveStudentModal(e) {
+      e.preventDefault();
+      const id = document.getElementById('student-id').value;
+      const firstName = document.getElementById('student-firstname').value.trim();
+      const lastName = document.getElementById('student-lastname').value.trim();
+      const activeEmail = document.getElementById('student-active-email').value.trim();
+      const validityDays = document.getElementById('student-validity').value;
+      const status = document.getElementById('student-status').value;
+      const errEl = document.getElementById('student-modal-error');
+      const btnText = document.getElementById('btn-save-student-text');
+
+      errEl.classList.add('hidden');
+      btnText.textContent = 'Saving...';
+
+      try {
+        const url = '/api/admin/students';
+        const method = id ? 'PUT' : 'POST';
+        const payload = { id, firstName, lastName, activeEmail, validityDays, status };
+        const res = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          closeStudentModal();
+          loadStudentAccounts();
+        } else {
+          errEl.textContent = data.error || 'Failed to save student account';
+          errEl.classList.remove('hidden');
+        }
+      } catch (err) {
+        errEl.textContent = 'Network error saving student mailbox';
+        errEl.classList.remove('hidden');
+      } finally {
+        btnText.textContent = id ? 'Save Changes' : 'Create Student Mailbox';
+      }
+    }
+
+    async function deleteStudentAccount(id, name) {
+      if (!confirm('Are you sure you want to permanently delete student account for ' + name + '? They will no longer be able to log in.')) {
+        return;
+      }
+      try {
+        const res = await fetch('/api/admin/students?id=' + encodeURIComponent(id), { method: 'DELETE' });
+        if (res.ok) {
+          loadStudentAccounts();
+        } else {
+          const err = await res.json();
+          alert(err.error || 'Failed to delete student');
+        }
+      } catch (e) {
+        alert('Network error deleting student account');
       }
     }
 
@@ -2941,6 +3603,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         if (securityView) securityView.classList.remove('hidden');
         if (btnSecurity) btnSecurity.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-amber-600/20 text-amber-300 font-medium';
         loadSecuritySettings();
+        loadStudentAccounts();
       } else {
         if (mailView) mailView.classList.remove('hidden');
       }
@@ -4188,18 +4851,18 @@ function renderLoginHtml(defaultEmail: string): string {
     <!-- STEP 1: Enter Email & Request OTP -->
     <div id="step-email" class="space-y-5">
       <div>
-        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Admin Email Address</label>
+        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">Account Email Address</label>
         <div class="relative">
           <span class="absolute inset-y-0 left-0 flex items-center pl-3.5 text-slate-500 pointer-events-none">
             <i class="fa-solid fa-envelope text-sm"></i>
           </span>
           <input type="email" id="auth-email" value="${defaultEmail}" required
-            placeholder="name@domain.com"
+            placeholder="name@domain.com or student email"
             class="w-full pl-10 pr-3.5 py-3 bg-slate-950 border border-slate-800 rounded-xl text-white text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all font-mono" />
         </div>
         <p class="text-[11px] text-slate-500 mt-1.5 flex items-center gap-1.5">
           <i class="fa-solid fa-shield-halved text-emerald-400"></i>
-          <span>Default authorized administrator account prefilled</span>
+          <span>Staff, Administrator, or Student Registered Email</span>
         </p>
       </div>
 
@@ -4216,7 +4879,7 @@ function renderLoginHtml(defaultEmail: string): string {
 
       <div class="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800/80 text-[11px] text-slate-400 flex items-start gap-2.5">
         <i class="fa-solid fa-key text-indigo-400 mt-0.5"></i>
-        <span>A 6-digit one-time password (OTP) will be generated and emailed securely to this address.</span>
+        <span>A 6-digit one-time password (OTP) will be generated and emailed securely to your active email.</span>
       </div>
     </div>
 
@@ -4309,7 +4972,7 @@ function renderLoginHtml(defaultEmail: string): string {
 
         if (res.ok && data.success) {
           pendingEmail = email;
-          document.getElementById('target-email-display').textContent = email;
+          document.getElementById('target-email-display').textContent = data.sentTo || email;
           document.getElementById('step-email').classList.add('hidden');
           document.getElementById('step-otp').classList.remove('hidden');
           document.getElementById('auth-code').value = '';
