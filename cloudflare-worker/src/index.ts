@@ -305,11 +305,8 @@ export default {
         isStarred: false,
       };
 
-      if (env.DB) {
-        await saveMessageToDB(env.DB, payload);
-        console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare D1 (folder: ${payload.folder}).`);
-      } else if (env.EMAILS) {
-        await saveMessageToKV(env.EMAILS, payload);
+      if (env.EMAILS) {
+        await env.EMAILS.put(`msg:${payload.date}:${msgId}`, JSON.stringify(payload));
         console.log(`Stored inbound email ${msgId} for mailbox ${targetAccount} in Cloudflare KV (folder: ${payload.folder}).`);
       }
     } catch (err: any) {
@@ -319,21 +316,13 @@ export default {
 
   // 1.5 SCHEDULED CRON HANDLER (Scheduled Sending)
   async scheduled(event: any, env: Env, ctx: any) {
+    if (!env.EMAILS) return;
     try {
       const now = Date.now();
-      if (env.DB) {
-        const { results } = await env.DB.prepare(
-          'SELECT * FROM scheduled_emails WHERE scheduled_time <= ?'
-        ).bind(now).all();
-
-        for (const row of (results || []) as any[]) {
-          let item: any;
-          try {
-            item = JSON.parse(row.payload_json);
-          } catch (e) {
-            continue;
-          }
-
+      const list = await env.EMAILS.list({ prefix: 'scheduled:' });
+      for (const key of list.keys) {
+        const item = (await env.EMAILS.get(key.name, 'json')) as any;
+        if (item && item.scheduledTime && item.scheduledTime <= now) {
           const apiKey = env.RESEND_API_KEY || env.SMTP_PASS;
           if (apiKey) {
             const resendPayload: any = {
@@ -382,69 +371,8 @@ export default {
                 messageId: resData.id,
                 trackingId: item.trackingId || null,
               };
-              await saveMessageToDB(env.DB, sentMsg);
-              await env.DB.prepare('DELETE FROM scheduled_emails WHERE id = ?').bind(row.id).run();
-              await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(row.id).run();
-            }
-          }
-        }
-      } else if (env.EMAILS) {
-        const schedIndex: string[] = (await env.EMAILS.get('index:scheduled', 'json')) || [];
-        for (const schedId of schedIndex) {
-          const item = (await env.EMAILS.get(`scheduled:${schedId}`, 'json')) as any;
-          if (item && item.scheduledTime && item.scheduledTime <= now) {
-            const apiKey = env.RESEND_API_KEY || env.SMTP_PASS;
-            if (apiKey) {
-              const resendPayload: any = {
-                from: item.fromFormatted || item.from,
-                to: item.toList,
-                subject: item.subject,
-                html: item.htmlWithTracking || item.html || `<p>${item.text}</p>`,
-              };
-              if (item.ccList && item.ccList.length > 0) resendPayload.cc = item.ccList;
-              if (item.bccList && item.bccList.length > 0) resendPayload.bcc = item.bccList;
-              if (item.attachments && item.attachments.length > 0) {
-                resendPayload.attachments = item.attachments.map((att: any) => ({
-                  filename: att.filename,
-                  content: att.contentBase64,
-                }));
-              }
-
-              const sendRes = await fetch('https://api.resend.com/emails', {
-                method: 'POST',
-                headers: {
-                  Authorization: `Bearer ${apiKey}`,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(resendPayload),
-              });
-
-              if (sendRes.ok) {
-                const resData = await sendRes.json() as any;
-                const sentId = `sent_${Date.now()}`;
-                const sentMsg = {
-                  id: sentId,
-                  account: item.from,
-                  from: item.from,
-                  fromName: item.fromName,
-                  to: item.toList.join(', '),
-                  cc: (item.ccList || []).join(', '),
-                  bcc: (item.bccList || []).join(', '),
-                  subject: item.subject,
-                  text: item.text || '',
-                  html: item.html || '',
-                  date: new Date().toISOString(),
-                  folder: 'sent',
-                  isRead: true,
-                  isStarred: false,
-                  attachments: item.attachments || [],
-                  messageId: resData.id,
-                  trackingId: item.trackingId || null,
-                };
-                await saveMessageToKV(env.EMAILS, sentMsg);
-                await deleteScheduledFromKV(env.EMAILS, schedId);
-                await deleteMessageFromKV(env.EMAILS, schedId);
-              }
+              await env.EMAILS.put(`msg:${sentMsg.date}:${sentId}`, JSON.stringify(sentMsg));
+              await env.EMAILS.delete(key.name);
             }
           }
         }
@@ -843,26 +771,12 @@ export default {
 
       const allFetched: any[] = [];
 
-      if (env.DB) {
-        try {
-          const { results } = await env.DB.prepare('SELECT * FROM messages ORDER BY date DESC').all();
-          for (const r of (results || []) as any[]) {
-            const msg = rowToMessage(r);
-            if (msg) allFetched.push(msg);
-          }
-        } catch (dbErr) {
-          console.error('D1 query error:', dbErr);
-        }
-      }
-
-      // Also merge any existing messages stored in KV
       if (env.EMAILS) {
         try {
-          const index: string[] = (await env.EMAILS.get('index:messages', 'json')) || [];
-          for (const entry of index) {
-            const keyName = entry.startsWith('msg:') ? entry : `msg:${entry}`;
-            const item = (await env.EMAILS.get(keyName, 'json')) as any;
-            if (item && !allFetched.some((m) => m.id === item.id)) {
+          const list = await env.EMAILS.list({ prefix: 'msg:' });
+          for (const key of list.keys) {
+            const item = (await env.EMAILS.get(key.name, 'json')) as any;
+            if (item) {
               if (!item.account) {
                 item.account = resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to);
               }
@@ -870,7 +784,21 @@ export default {
             }
           }
         } catch (kvErr) {
-          console.error('KV index read error:', kvErr);
+          console.error('KV list error:', kvErr);
+          // Fallback to index if list errors
+          try {
+            const index: string[] = (await env.EMAILS.get('index:messages', 'json')) || [];
+            for (const entry of index) {
+              const keyName = entry.startsWith('msg:') ? entry : `msg:${entry}`;
+              const item = (await env.EMAILS.get(keyName, 'json')) as any;
+              if (item && !allFetched.some((m) => m.id === item.id)) {
+                if (!item.account) {
+                  item.account = resolveAccount(item.folder === 'sent' || item.folder === 'drafts' ? item.from : item.to);
+                }
+                allFetched.push(item);
+              }
+            }
+          } catch (e) {}
         }
       }
 
@@ -990,16 +918,17 @@ export default {
           attachments: attachments || [],
         };
 
-        if (env.DB) {
+        if (env.EMAILS) {
           if (id) {
-            await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(id).run();
+            try {
+              const list = await env.EMAILS.list({ prefix: 'msg:' });
+              const oldKey = list.keys.find((k: any) => k.name.endsWith(id));
+              if (oldKey) {
+                await env.EMAILS.delete(oldKey.name);
+              }
+            } catch (e) {}
           }
-          await saveMessageToDB(env.DB, draftMsg);
-        } else if (env.EMAILS) {
-          if (id) {
-            await deleteMessageFromKV(env.EMAILS, id);
-          }
-          await saveMessageToKV(env.EMAILS, draftMsg);
+          await env.EMAILS.put(`msg:${draftDate}:${draftId}`, JSON.stringify(draftMsg));
         }
 
         return new Response(JSON.stringify({ success: true, draft: draftMsg }), {
@@ -1098,11 +1027,8 @@ export default {
               trackingId,
             };
 
-            if (env.DB) {
-              await env.DB.prepare(`
-                INSERT OR REPLACE INTO scheduled_emails (id, scheduled_time, payload_json, created_at)
-                VALUES (?, ?, ?, ?)
-              `).bind(schedId, schedTime, JSON.stringify(schedPayload), Date.now()).run();
+            if (env.EMAILS) {
+              await env.EMAILS.put(`scheduled:${schedTime}:${schedId}`, JSON.stringify(schedPayload));
               // Also store in Drafts/Scheduled so user sees it in their mailbox
               const schedMsg = {
                 id: schedId,
@@ -1121,28 +1047,7 @@ export default {
                 scheduledTime: schedTime,
                 attachments: attachments || [],
               };
-              await saveMessageToDB(env.DB, schedMsg);
-            } else if (env.EMAILS) {
-              await scheduleMessageInKV(env.EMAILS, schedId, schedPayload);
-              // Also store in Drafts/Scheduled so user sees it in their mailbox
-              const schedMsg = {
-                id: schedId,
-                account: senderEmail,
-                from: senderEmail,
-                fromName: senderDisplayName,
-                to: toList.join(', '),
-                subject: `[Scheduled: ${new Date(schedTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })}] ` + (subject || ''),
-                text: text || '',
-                html: html || '',
-                date: new Date().toISOString(),
-                folder: 'drafts',
-                isRead: true,
-                isStarred: false,
-                isScheduled: true,
-                scheduledTime: schedTime,
-                attachments: attachments || [],
-              };
-              await saveMessageToKV(env.EMAILS, schedMsg);
+              await env.EMAILS.put(`msg:${schedMsg.date}:${schedId}`, JSON.stringify(schedMsg));
             }
 
             return new Response(JSON.stringify({ success: true, scheduled: true, scheduledAt: new Date(schedTime).toISOString() }), {
@@ -1196,12 +1101,14 @@ export default {
         }
 
         // If this message was sent from a saved draft, delete the draft now
-        if (draftId) {
-          if (env.DB) {
-            await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(draftId).run();
-          } else if (env.EMAILS) {
-            await deleteMessageFromKV(env.EMAILS, draftId);
-          }
+        if (draftId && env.EMAILS) {
+          try {
+            const list = await env.EMAILS.list({ prefix: 'msg:' });
+            const draftKey = list.keys.find((k: any) => k.name.endsWith(draftId));
+            if (draftKey) {
+              await env.EMAILS.delete(draftKey.name);
+            }
+          } catch (e) {}
         }
 
         // Store copy in Sent folder
@@ -1226,10 +1133,8 @@ export default {
           trackingId: trackingId || null,
         };
 
-        if (env.DB) {
-          await saveMessageToDB(env.DB, sentMsg);
-        } else if (env.EMAILS) {
-          await saveMessageToKV(env.EMAILS, sentMsg);
+        if (env.EMAILS) {
+          await env.EMAILS.put(`msg:${sentMsg.date}:${sentId}`, JSON.stringify(sentMsg));
         }
 
         return new Response(JSON.stringify({ success: true, message: sentMsg }), {
@@ -1249,35 +1154,23 @@ export default {
         const body = (await request.json()) as any;
         const { id, action, isRead } = body;
 
-        if (env.DB) {
-          if (action === 'delete') {
-            await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(id).run();
-          } else if (action === 'toggleStar') {
-            await env.DB.prepare('UPDATE messages SET is_starred = CASE WHEN is_starred = 1 THEN 0 ELSE 1 END WHERE id = ?').bind(id).run();
-          } else if (typeof isRead === 'boolean') {
-            await env.DB.prepare('UPDATE messages SET is_read = ? WHERE id = ?').bind(isRead ? 1 : 0, id).run();
-          }
-        } else if (env.EMAILS) {
+        if (env.EMAILS) {
           try {
-            if (action === 'delete') {
-              await deleteMessageFromKV(env.EMAILS, id);
-            } else {
-              let item = (await env.EMAILS.get(`msg:${id}`, 'json')) as any;
-              let targetKey = `msg:${id}`;
-              if (!item) {
-                const index: string[] = (await env.EMAILS.get('index:messages', 'json')) || [];
-                const matchedKey = index.find((k: string) => k.endsWith(id));
-                if (matchedKey) {
-                  item = (await env.EMAILS.get(matchedKey, 'json')) as any;
-                  targetKey = matchedKey;
+            const list = await env.EMAILS.list({ prefix: 'msg:' });
+            const target = list.keys.find((k: any) => k.name.endsWith(id));
+
+            if (target) {
+              if (action === 'delete') {
+                await env.EMAILS.delete(target.name);
+              } else {
+                const item = (await env.EMAILS.get(target.name, 'json')) as any;
+                if (item) {
+                  if (typeof isRead === 'boolean') item.isRead = isRead;
+                  if (action === 'toggleStar') item.isStarred = !item.isStarred;
+                  if (body.folder) item.folder = body.folder;
+                  if (typeof body.isSpam === 'boolean') item.isSpam = body.isSpam;
+                  await env.EMAILS.put(target.name, JSON.stringify(item));
                 }
-              }
-              if (item) {
-                if (typeof isRead === 'boolean') item.isRead = isRead;
-                if (action === 'toggleStar') item.isStarred = !item.isStarred;
-                if (body.folder) item.folder = body.folder;
-                if (typeof body.isSpam === 'boolean') item.isSpam = body.isSpam;
-                await env.EMAILS.put(targetKey, JSON.stringify(item));
               }
             }
           } catch (e) {
@@ -2791,7 +2684,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       const editor = document.getElementById('compose-editor');
       const senderDisplay = selectedMsg.fromName ? (selectedMsg.fromName + ' &lt;' + selectedMsg.from + '&gt;') : selectedMsg.from;
       const formattedDate = new Date(selectedMsg.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
-      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\n/g, '<br/>') + '</p>' : '');
+      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\\n/g, '<br/>') + '</p>' : '');
 
       editor.innerHTML = '<p></p><br><div class="gmail_quote" style="border-left: 2px solid #cbd5e1; padding-left: 10px; margin-left: 2px; color: #64748b; font-size: 13px;"><p style="margin: 0 0 6px 0;">On ' + formattedDate + ', ' + senderDisplay + ' wrote:</p><div>' + origBody + '</div></div>';
       setTimeout(function() {
@@ -2830,7 +2723,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       const senderDisplay = selectedMsg.fromName ? (selectedMsg.fromName + ' &lt;' + selectedMsg.from + '&gt;') : selectedMsg.from;
       const formattedDate = new Date(selectedMsg.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
       const origTo = selectedMsg.to ? '<br><strong>To:</strong> ' + selectedMsg.to : '';
-      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\n/g, '<br/>') + '</p>' : '');
+      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\\n/g, '<br/>') + '</p>' : '');
 
       editor.innerHTML = '<p></p><br><div class="forwarded_message" style="border-left: 2px solid #cbd5e1; padding-left: 12px; margin-left: 2px; color: #475569; font-size: 13px;">' +
         '<p style="margin: 0 0 8px 0; color: #64748b; font-size: 12px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">' +
@@ -2910,8 +2803,8 @@ function renderWebAppHtml(currentUserEmail?: string): string {
           const bl = document.getElementById('security-blocklist');
           const al = document.getElementById('security-allowlist');
           const kw = document.getElementById('security-keywords');
-          if (bl) bl.value = (data.settings.blocklist || []).join('\n');
-          if (al) al.value = (data.settings.allowlist || []).join('\n');
+          if (bl) bl.value = (data.settings.blocklist || []).join(String.fromCharCode(10));
+          if (al) al.value = (data.settings.allowlist || []).join(String.fromCharCode(10));
           if (kw) kw.value = (data.settings.spamKeywords || []).join(', ');
         }
       } catch (err) {
@@ -2926,8 +2819,9 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       const al = document.getElementById('security-allowlist');
       const kw = document.getElementById('security-keywords');
 
-      const blocklist = (bl ? bl.value : '').split('\n').map(s => s.trim().toLowerCase()).filter(Boolean);
-      const allowlist = (al ? al.value : '').split('\n').map(s => s.trim().toLowerCase()).filter(Boolean);
+      const nl = String.fromCharCode(10);
+      const blocklist = (bl ? bl.value : '').split(nl).map(s => s.trim().toLowerCase()).filter(Boolean);
+      const allowlist = (al ? al.value : '').split(nl).map(s => s.trim().toLowerCase()).filter(Boolean);
       const spamKeywords = (kw ? kw.value : '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
       if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
