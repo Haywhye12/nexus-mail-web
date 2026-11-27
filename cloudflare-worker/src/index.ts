@@ -46,6 +46,50 @@ export async function saveStudentAccounts(kv: any, list: StudentAccount[]): Prom
   await kv.put('students:list', JSON.stringify(list));
 }
 
+// ==========================================
+// Community & General Group Hub
+// Accessible by Students, Staff, and Admins
+// ==========================================
+export interface CommunityReply {
+  id: string;
+  authorEmail: string;
+  authorName: string;
+  authorRole: 'superadmin' | 'admin' | 'student' | 'member';
+  content: string;
+  createdAt: string;
+}
+
+export interface CommunityPost {
+  id: string;
+  title: string;
+  content: string;
+  category: 'question' | 'report' | 'announcement' | 'general';
+  authorEmail: string;
+  authorName: string;
+  authorRole: 'superadmin' | 'admin' | 'student' | 'member';
+  isPinned?: boolean;
+  status?: 'open' | 'pending' | 'reviewed' | 'resolved'; // for reports & questions
+  replies: CommunityReply[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function getCommunityPosts(kv: any): Promise<CommunityPost[]> {
+  if (!kv) return [];
+  try {
+    const posts = await kv.get('community:posts', 'json');
+    return Array.isArray(posts) ? posts : [];
+  } catch (e) {
+    console.error('getCommunityPosts error:', e);
+    return [];
+  }
+}
+
+export async function saveCommunityPosts(kv: any, posts: CommunityPost[]): Promise<void> {
+  if (!kv) return;
+  await kv.put('community:posts', JSON.stringify(posts));
+}
+
 export function sanitizeEmailHandle(str: string): string {
   return (str || '')
     .trim()
@@ -1048,6 +1092,238 @@ export default {
       }
     }
 
+    // ==========================================
+    // COMMUNITY & GENERAL GROUP API ENDPOINTS
+    // Available to ALL authenticated users (Students, Staff, Admins)
+    // ==========================================
+
+    // API: GET /api/community/posts - List all community posts
+    if (url.pathname === '/api/community/posts' && request.method === 'GET') {
+      try {
+        const posts = await getCommunityPosts(env.EMAILS);
+        // Sort: pinned first, then newest updated/created
+        posts.sort((a, b) => {
+          if (a.isPinned && !b.isPinned) return -1;
+          if (!a.isPinned && b.isPinned) return 1;
+          const timeA = new Date(a.updatedAt || a.createdAt).getTime();
+          const timeB = new Date(b.updatedAt || b.createdAt).getTime();
+          return timeB - timeA;
+        });
+
+        return new Response(JSON.stringify({ posts, currentUser: { email: userPerms.email, name: userPerms.name, role: userPerms.role } }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message || 'Failed to fetch community posts.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // API: POST /api/community/posts - Create a new post or report
+    if (url.pathname === '/api/community/posts' && request.method === 'POST') {
+      try {
+        const body = (await request.json()) as any;
+        const title = (body.title || '').trim();
+        const postContent = (body.content || '').trim();
+        const category = ['question', 'report', 'announcement', 'general'].includes(body.category)
+          ? body.category
+          : 'general';
+
+        if (!title || !postContent) {
+          return new Response(JSON.stringify({ error: 'Title and content are required.' }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        // Only superadmin/admin can post official announcements or pin posts
+        let isPinned = false;
+        if ((category === 'announcement' || body.isPinned) && !['superadmin', 'admin'].includes(userPerms.role)) {
+          return new Response(JSON.stringify({ error: 'Only administrators can post official announcements or pin topics.' }), {
+            status: 403,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+        if (body.isPinned && ['superadmin', 'admin'].includes(userPerms.role)) {
+          isPinned = true;
+        }
+
+        const now = new Date().toISOString();
+        const newPost: CommunityPost = {
+          id: 'post_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7),
+          title,
+          content: postContent,
+          category,
+          authorEmail: userPerms.email,
+          authorName: userPerms.name || userPerms.email.split('@')[0],
+          authorRole: userPerms.role,
+          isPinned,
+          status: category === 'report' ? 'pending' : (category === 'question' ? 'open' : undefined),
+          replies: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        const existingPosts = await getCommunityPosts(env.EMAILS);
+        existingPosts.unshift(newPost);
+        await saveCommunityPosts(env.EMAILS, existingPosts);
+
+        return new Response(JSON.stringify({ success: true, post: newPost }), {
+          status: 201,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message || 'Failed to create community post.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // API: POST /api/community/reply - Add a reply to a post
+    if (url.pathname === '/api/community/reply' && request.method === 'POST') {
+      try {
+        const body = (await request.json()) as any;
+        const postId = (body.postId || '').trim();
+        const replyContent = (body.content || '').trim();
+
+        if (!postId || !replyContent) {
+          return new Response(JSON.stringify({ error: 'Post ID and reply content are required.' }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const posts = await getCommunityPosts(env.EMAILS);
+        const post = posts.find((p) => p.id === postId);
+        if (!post) {
+          return new Response(JSON.stringify({ error: 'Post not found.' }), {
+            status: 404,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const now = new Date().toISOString();
+        const newReply: CommunityReply = {
+          id: 'rep_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7),
+          authorEmail: userPerms.email,
+          authorName: userPerms.name || userPerms.email.split('@')[0],
+          authorRole: userPerms.role,
+          content: replyContent,
+          createdAt: now,
+        };
+
+        if (!Array.isArray(post.replies)) post.replies = [];
+        post.replies.push(newReply);
+        post.updatedAt = now;
+
+        await saveCommunityPosts(env.EMAILS, posts);
+
+        return new Response(JSON.stringify({ success: true, reply: newReply }), {
+          status: 201,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message || 'Failed to submit reply.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // API: POST /api/community/status - Update post status (e.g. report pending -> reviewed -> resolved)
+    if (url.pathname === '/api/community/status' && request.method === 'POST') {
+      try {
+        const body = (await request.json()) as any;
+        const postId = (body.postId || '').trim();
+        const newStatus = (body.status || '').trim().toLowerCase();
+
+        if (!postId || !['open', 'pending', 'reviewed', 'resolved'].includes(newStatus)) {
+          return new Response(JSON.stringify({ error: 'Valid post ID and status are required.' }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const posts = await getCommunityPosts(env.EMAILS);
+        const post = posts.find((p) => p.id === postId);
+        if (!post) {
+          return new Response(JSON.stringify({ error: 'Post not found.' }), {
+            status: 404,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        // Only admins can change status, except authors can mark their own question/report as resolved
+        const isAdmin = ['superadmin', 'admin'].includes(userPerms.role);
+        const isAuthor = post.authorEmail.toLowerCase() === userPerms.email.toLowerCase();
+        if (!isAdmin && (!isAuthor || newStatus !== 'resolved')) {
+          return new Response(JSON.stringify({ error: 'Permission denied to update post status.' }), {
+            status: 403,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        post.status = newStatus as any;
+        post.updatedAt = new Date().toISOString();
+        await saveCommunityPosts(env.EMAILS, posts);
+
+        return new Response(JSON.stringify({ success: true, post }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message || 'Failed to update status.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // API: DELETE /api/community/posts - Delete a post
+    if (url.pathname === '/api/community/posts' && request.method === 'DELETE') {
+      try {
+        const postId = url.searchParams.get('id');
+        if (!postId) {
+          return new Response(JSON.stringify({ error: 'Post ID is required.' }), {
+            status: 400,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const posts = await getCommunityPosts(env.EMAILS);
+        const post = posts.find((p) => p.id === postId);
+        if (!post) {
+          return new Response(JSON.stringify({ error: 'Post not found.' }), {
+            status: 404,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const isAdmin = ['superadmin', 'admin'].includes(userPerms.role);
+        const isAuthor = post.authorEmail.toLowerCase() === userPerms.email.toLowerCase();
+        if (!isAdmin && !isAuthor) {
+          return new Response(JSON.stringify({ error: 'Permission denied to delete this post.' }), {
+            status: 403,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const updated = posts.filter((p) => p.id !== postId);
+        await saveCommunityPosts(env.EMAILS, updated);
+
+        return new Response(JSON.stringify({ success: true, deletedId: postId }), {
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message || 'Failed to delete post.' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     // API: GET /api/messages
     if (url.pathname === '/api/messages') {
       const folder = url.searchParams.get('folder') || 'inbox';
@@ -1678,6 +1954,16 @@ function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAcc
     body.theme-dark #security-view table tr { border-color: #1e293b !important; }
     body.theme-dark #security-view table th { color: #94a3b8 !important; }
     body.theme-dark #security-view table td { color: #cbd5e1 !important; }
+    /* Community Hub Dark Theme */
+    body.theme-dark #community-view { background-color: #020617 !important; color: #f8fafc !important; }
+    body.theme-dark #community-view .bg-white { background-color: #0f172a !important; border-color: #1e293b !important; color: #f8fafc !important; }
+    body.theme-dark #community-view .bg-slate-50 { background-color: #1e293b !important; }
+    body.theme-dark #community-view .text-slate-900, body.theme-dark #community-view .text-slate-800 { color: #f8fafc !important; }
+    body.theme-dark #community-view .text-slate-600, body.theme-dark #community-view .text-slate-700 { color: #cbd5e1 !important; }
+    body.theme-dark #community-view .border-slate-100, body.theme-dark #community-view .border-slate-200 { border-color: #1e293b !important; }
+    body.theme-dark #community-modal .bg-white { background-color: #0f172a !important; border-color: #1e293b !important; color: #f8fafc !important; }
+    body.theme-dark #community-modal .bg-slate-50\/50 { background-color: #1e293b !important; }
+    body.theme-dark #community-modal input, body.theme-dark #community-modal select, body.theme-dark #community-modal textarea { background-color: #1e293b !important; border-color: #334155 !important; color: #f8fafc !important; }
     body.theme-dark #security-view table tr:hover { background-color: #1e293b/50 !important; }
     body.theme-dark #student-modal .bg-white { background-color: #0f172a !important; border-color: #1e293b !important; color: #f8fafc !important; }
     body.theme-dark #student-modal .bg-slate-50\/50 { background-color: #1e293b !important; border-color: #334155 !important; }
@@ -1870,6 +2156,15 @@ function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAcc
       <div class="pt-2 pb-1 px-3">
         <div class="border-t border-slate-800"></div>
       </div>
+
+      <!-- General Group & Community Hub (Students, Staff & Admins) -->
+      <button onclick="switchTab('community')" id="btn-community" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
+        <div class="flex items-center space-x-3">
+          <i class="fa-solid fa-comments w-4 text-sky-400"></i>
+          <span class="font-medium">General Group</span>
+        </div>
+        <span class="px-1.5 py-0.2 rounded text-[9px] bg-sky-950 text-sky-300 border border-sky-800/60 font-semibold uppercase">Community</span>
+      </button>
 
       <!-- Nexus Meet (Video Training & Screen Sharing) -->
       <button onclick="switchTab('meet')" id="btn-meet" class="w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors">
@@ -2481,6 +2776,148 @@ function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAcc
           <span>Security rules saved successfully and updated in Cloudflare KV!</span>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- GENERAL GROUP & COMMUNITY HUB VIEW (Accessible by Students, Staff, and Admins) -->
+  <div id="community-view" class="hidden flex-1 flex flex-col bg-slate-50 h-full overflow-hidden">
+    <!-- View Header -->
+    <div class="bg-white border-b border-slate-200 px-6 py-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3 shrink-0">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-sky-100 text-sky-600 flex items-center justify-center text-lg font-bold shadow-sm">
+          <i class="fa-solid fa-comments"></i>
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <h2 class="text-base font-bold text-slate-900">Nexus Community Hub & General Group</h2>
+            <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">All Members</span>
+          </div>
+          <p class="text-xs text-slate-500">Ask questions, submit and track student reports, participate in technical discussions, and view official broadcasts.</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-2">
+        <button onclick="loadCommunityPosts()" class="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg border border-slate-200 transition-colors flex items-center space-x-1.5" title="Refresh feed">
+          <i class="fa-solid fa-arrows-rotate"></i>
+          <span>Refresh</span>
+        </button>
+        <button onclick="openCommunityModal()" class="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold rounded-lg shadow-sm active:scale-95 transition-all flex items-center space-x-1.5">
+          <i class="fa-solid fa-plus"></i>
+          <span>New Post or Report</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Filter Pills & Search Bar -->
+    <div class="bg-white border-b border-slate-200 px-6 py-2.5 flex flex-col sm:flex-row items-center justify-between gap-2 shrink-0">
+      <!-- Category Filter Pills -->
+      <div class="flex items-center space-x-1.5 overflow-x-auto w-full sm:w-auto pb-1 sm:pb-0 custom-scroll">
+        <button onclick="filterCommunityCategory('all')" id="com-pill-all" class="px-3 py-1 rounded-full text-xs font-semibold bg-sky-600 text-white shadow-sm transition-all whitespace-nowrap">
+          All Posts (<span id="com-count-all">0</span>)
+        </button>
+        <button onclick="filterCommunityCategory('question')" id="com-pill-question" class="px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:bg-slate-100 transition-all whitespace-nowrap flex items-center space-x-1">
+          <i class="fa-solid fa-circle-question text-indigo-500"></i>
+          <span>Questions</span>
+          <span id="com-count-question" class="text-[10px] font-mono ml-0.5 px-1.5 py-0.2 rounded-full bg-slate-100">0</span>
+        </button>
+        <button onclick="filterCommunityCategory('report')" id="com-pill-report" class="px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:bg-slate-100 transition-all whitespace-nowrap flex items-center space-x-1">
+          <i class="fa-solid fa-file-invoice text-amber-500"></i>
+          <span>Reports</span>
+          <span id="com-count-report" class="text-[10px] font-mono ml-0.5 px-1.5 py-0.2 rounded-full bg-slate-100">0</span>
+        </button>
+        <button onclick="filterCommunityCategory('announcement')" id="com-pill-announcement" class="px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:bg-slate-100 transition-all whitespace-nowrap flex items-center space-x-1">
+          <i class="fa-solid fa-bullhorn text-rose-500"></i>
+          <span>Announcements</span>
+          <span id="com-count-announcement" class="text-[10px] font-mono ml-0.5 px-1.5 py-0.2 rounded-full bg-slate-100">0</span>
+        </button>
+        <button onclick="filterCommunityCategory('general')" id="com-pill-general" class="px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:bg-slate-100 transition-all whitespace-nowrap flex items-center space-x-1">
+          <i class="fa-solid fa-hashtag text-slate-500"></i>
+          <span>General</span>
+          <span id="com-count-general" class="text-[10px] font-mono ml-0.5 px-1.5 py-0.2 rounded-full bg-slate-100">0</span>
+        </button>
+      </div>
+
+      <!-- Search Input -->
+      <div class="relative w-full sm:w-64">
+        <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
+        <input type="text" id="community-search-input" oninput="filterCommunitySearch()" placeholder="Search discussions & reports..." class="w-full pl-8 pr-3 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-sky-500 bg-slate-50 focus:bg-white" />
+      </div>
+    </div>
+
+    <!-- Feed Container -->
+    <div class="flex-1 overflow-y-auto custom-scroll p-6">
+      <div class="max-w-4xl mx-auto space-y-4" id="community-posts-feed">
+        <!-- Dynamically rendered by renderCommunityFeed() -->
+        <div class="p-8 text-center text-slate-400 text-xs">
+          <i class="fa-solid fa-spinner fa-spin text-lg mb-2 text-sky-500"></i>
+          <p>Loading community posts and discussions...</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CREATE COMMUNITY POST / REPORT MODAL -->
+  <div id="community-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm">
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+      <!-- Header -->
+      <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+        <div class="flex items-center space-x-2.5">
+          <div class="w-8 h-8 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center font-bold text-sm">
+            <i class="fa-solid fa-pen-nib"></i>
+          </div>
+          <div>
+            <h3 class="font-bold text-sm text-slate-900">Create Community Post</h3>
+            <p class="text-[11px] text-slate-500">Share with students, instructors, and the DevGeeksNexus team</p>
+          </div>
+        </div>
+        <button onclick="closeCommunityModal()" class="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <!-- Form Body -->
+      <form id="community-form" onsubmit="submitCommunityPost(event)" class="p-5 space-y-4 overflow-y-auto">
+        <!-- Category Selector -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Post Category *</label>
+          <select id="com-category-select" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 bg-white">
+            <option value="question">❓ Ask a Question (Coursework, Code, Help)</option>
+            <option value="report">📋 Submit a Report (Project, Assignment, Issue)</option>
+            <option value="general">💬 General Interaction & Discussion</option>
+            ${!isStudent ? '<option value="announcement">📢 Official Announcement (Admins Only)</option>' : ''}
+          </select>
+        </div>
+
+        <!-- Title -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Title *</label>
+          <input type="text" id="com-post-title" required placeholder="e.g. Question on React Hooks or Project Report: Task 3" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-sky-500" />
+        </div>
+
+        <!-- Content -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">Details / Report Content *</label>
+          <textarea id="com-post-content" rows="6" required placeholder="Provide clear details, code examples, steps, or report findings..." class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 font-sans"></textarea>
+        </div>
+
+        ${!isStudent ? `
+        <!-- Admin Pin Checkbox -->
+        <div class="flex items-center space-x-2 pt-1">
+          <input type="checkbox" id="com-post-pinned" class="rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+          <label for="com-post-pinned" class="text-xs font-medium text-slate-700">Pin this post to the top of the group</label>
+        </div>
+        ` : ''}
+
+        <div id="com-post-error" class="hidden text-xs text-rose-600 font-medium p-2 bg-rose-50 rounded-lg border border-rose-100"></div>
+
+        <!-- Modal Footer -->
+        <div class="pt-3 border-t border-slate-100 flex items-center justify-end space-x-2">
+          <button type="button" onclick="closeCommunityModal()" class="px-4 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-600 hover:bg-slate-50 transition-colors">Cancel</button>
+          <button type="submit" id="btn-submit-community-post" class="px-5 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow-sm active:scale-95 transition-all flex items-center space-x-1.5">
+            <i class="fa-solid fa-paper-plane"></i>
+            <span>Publish Post</span>
+          </button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -3352,6 +3789,370 @@ function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAcc
       }
     }
 
+    // ==========================================
+    // COMMUNITY & GENERAL GROUP ENGINE
+    // ==========================================
+    let allCommunityPosts = [];
+    let currentCommunityFilter = 'all';
+    let currentCommunitySearch = '';
+    let currentCommunityUser = null;
+
+    function escapeHtmlText(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function nl2br(str) {
+      if (!str) return '';
+      return escapeHtmlText(str).split(String.fromCharCode(10)).join('<br/>');
+    }
+
+    async function loadCommunityPosts() {
+      const feed = document.getElementById('community-posts-feed');
+      try {
+        const res = await fetch('/api/community/posts');
+        if (!res.ok) throw new Error('Failed to fetch posts');
+        const data = await res.json();
+        allCommunityPosts = data.posts || [];
+        currentCommunityUser = data.currentUser || null;
+        updateCommunityCounts();
+        renderCommunityFeed();
+      } catch (err) {
+        console.error('loadCommunityPosts error:', err);
+        if (feed) {
+          feed.innerHTML = '<div class="p-8 text-center text-rose-500 text-xs"><i class="fa-solid fa-circle-exclamation mr-1"></i> Failed to load community posts. Please click Refresh above.</div>';
+        }
+      }
+    }
+
+    function updateCommunityCounts() {
+      const counts = { all: allCommunityPosts.length, question: 0, report: 0, announcement: 0, general: 0 };
+      allCommunityPosts.forEach(p => {
+        if (counts[p.category] !== undefined) counts[p.category]++;
+      });
+      ['all', 'question', 'report', 'announcement', 'general'].forEach(cat => {
+        const el = document.getElementById('com-count-' + cat);
+        if (el) el.textContent = counts[cat];
+      });
+    }
+
+    function filterCommunityCategory(cat) {
+      currentCommunityFilter = cat;
+      ['all', 'question', 'report', 'announcement', 'general'].forEach(c => {
+        const pill = document.getElementById('com-pill-' + c);
+        if (pill) {
+          if (c === cat) {
+            pill.className = 'px-3 py-1 rounded-full text-xs font-semibold bg-sky-600 text-white shadow-sm transition-all whitespace-nowrap flex items-center space-x-1';
+          } else {
+            pill.className = 'px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:bg-slate-100 transition-all whitespace-nowrap flex items-center space-x-1';
+          }
+        }
+      });
+      renderCommunityFeed();
+    }
+
+    function filterCommunitySearch() {
+      const el = document.getElementById('community-search-input');
+      currentCommunitySearch = (el ? el.value : '').trim().toLowerCase();
+      renderCommunityFeed();
+    }
+
+    function renderCommunityFeed() {
+      const feed = document.getElementById('community-posts-feed');
+      if (!feed) return;
+
+      let filtered = allCommunityPosts.filter(p => {
+        if (currentCommunityFilter !== 'all' && p.category !== currentCommunityFilter) return false;
+        if (currentCommunitySearch) {
+          const matchTitle = (p.title || '').toLowerCase().includes(currentCommunitySearch);
+          const matchContent = (p.content || '').toLowerCase().includes(currentCommunitySearch);
+          const matchAuthor = (p.authorName || '').toLowerCase().includes(currentCommunitySearch) || (p.authorEmail || '').toLowerCase().includes(currentCommunitySearch);
+          if (!matchTitle && !matchContent && !matchAuthor) return false;
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        feed.innerHTML = '<div class="bg-white rounded-xl border border-slate-200 p-12 text-center text-slate-400 text-xs">' +
+          '<i class="fa-solid fa-comments text-3xl mb-3 text-slate-300"></i>' +
+          '<p class="font-semibold text-slate-600 text-sm">No community posts found</p>' +
+          '<p class="mt-1 text-slate-400">Be the first to ask a question, submit a student report, or start a discussion!</p>' +
+          '<button onclick="openCommunityModal()" class="mt-4 px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg font-medium text-xs shadow-sm transition-all">' +
+            '<i class="fa-solid fa-plus mr-1"></i> Create Post / Report' +
+          '</button>' +
+        '</div>';
+        return;
+      }
+
+      feed.innerHTML = filtered.map(p => {
+        // Category styling badge
+        let catBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-700 uppercase tracking-wide">General</span>';
+        if (p.category === 'question') {
+          catBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-indigo-100 text-indigo-700 uppercase tracking-wide flex items-center space-x-1"><i class="fa-solid fa-circle-question mr-1"></i> Question</span>';
+        } else if (p.category === 'report') {
+          catBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800 uppercase tracking-wide flex items-center space-x-1"><i class="fa-solid fa-file-invoice mr-1"></i> Student Report</span>';
+        } else if (p.category === 'announcement') {
+          catBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-100 text-rose-700 uppercase tracking-wide flex items-center space-x-1"><i class="fa-solid fa-bullhorn mr-1"></i> Announcement</span>';
+        }
+
+        // Status badge for reports / questions
+        let statusBadge = '';
+        if (p.status) {
+          if (p.status === 'pending') {
+            statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200 flex items-center gap-1"><i class="fa-solid fa-clock"></i> Pending Review</span>';
+          } else if (p.status === 'reviewed') {
+            statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200 flex items-center gap-1"><i class="fa-solid fa-clipboard-check"></i> Reviewed</span>';
+          } else if (p.status === 'resolved') {
+            statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1"><i class="fa-solid fa-circle-check"></i> Resolved</span>';
+          } else if (p.status === 'open') {
+            statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 flex items-center gap-1"><i class="fa-solid fa-envelope-open-text"></i> Open</span>';
+          }
+        }
+
+        // Author Role Badge
+        let roleBadge = '<span class="text-[9px] px-1.5 py-0.2 rounded font-mono font-semibold bg-slate-100 text-slate-600">Member</span>';
+        if (p.authorRole === 'superadmin' || p.authorRole === 'admin') {
+          roleBadge = '<span class="text-[9px] px-1.5 py-0.2 rounded font-mono font-bold bg-amber-100 text-amber-800 border border-amber-200">Instructor / Admin</span>';
+        } else if (p.authorRole === 'student') {
+          roleBadge = '<span class="text-[9px] px-1.5 py-0.2 rounded font-mono font-semibold bg-sky-100 text-sky-700 border border-sky-200">Student</span>';
+        }
+
+        const isAdmin = currentCommunityUser && (currentCommunityUser.role === 'superadmin' || currentCommunityUser.role === 'admin');
+        const isAuthor = currentCommunityUser && (currentCommunityUser.email.toLowerCase() === p.authorEmail.toLowerCase());
+
+        // Status update dropdown for Admins or author resolution
+        let statusControls = '';
+        if (isAdmin && (p.category === 'report' || p.category === 'question')) {
+          statusControls = '<div class="flex items-center space-x-1">' +
+            '<span class="text-[10px] text-slate-400 font-medium">Status:</span>' +
+            '<select data-id="' + p.id + '" onchange="changeCommunityStatus(this.dataset.id, this.value)" class="text-[11px] font-semibold rounded border border-slate-200 bg-white px-2 py-0.5 text-slate-700 focus:outline-none focus:ring-1 focus:ring-sky-500">' +
+              '<option value="pending"' + (p.status === 'pending' ? ' selected' : '') + '>Pending Review</option>' +
+              '<option value="reviewed"' + (p.status === 'reviewed' ? ' selected' : '') + '>Reviewed</option>' +
+              '<option value="resolved"' + (p.status === 'resolved' ? ' selected' : '') + '>Resolved</option>' +
+              '<option value="open"' + (p.status === 'open' ? ' selected' : '') + '>Open</option>' +
+            '</select>' +
+          '</div>';
+        } else if (isAuthor && p.status !== 'resolved' && (p.category === 'report' || p.category === 'question')) {
+          statusControls = '<button data-id="' + p.id + '" data-status="resolved" onclick="changeCommunityStatus(this.dataset.id, this.dataset.status)" class="px-2 py-0.5 text-[10px] font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded transition-colors">' +
+            '<i class="fa-solid fa-check mr-1"></i> Mark Resolved' +
+          '</button>';
+        }
+
+        // Delete button for Admin or Author
+        let deleteBtn = '';
+        if (isAdmin || isAuthor) {
+          deleteBtn = '<button data-id="' + p.id + '" onclick="deleteCommunityPost(this.dataset.id)" class="text-slate-400 hover:text-rose-600 transition-colors p-1" title="Delete post">' +
+            '<i class="fa-solid fa-trash-can text-xs"></i>' +
+          '</button>';
+        }
+
+        // Pinned ribbon
+        let pinnedRibbon = '';
+        if (p.isPinned) {
+          pinnedRibbon = '<span class="flex items-center space-x-1 text-[10px] font-bold text-amber-600 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">' +
+            '<i class="fa-solid fa-thumbtack text-amber-500"></i>' +
+            '<span>Pinned Announcement</span>' +
+          '</span>';
+        }
+
+        // Replies list HTML
+        const replies = p.replies || [];
+        let repliesHtml = '';
+        if (replies.length > 0) {
+          repliesHtml = '<div class="mt-4 pt-3 border-t border-slate-100 space-y-2.5">' +
+            '<h5 class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Replies & Discussion (' + replies.length + ')</h5>' +
+            replies.map(r => {
+              let rRoleBadge = '<span class="text-[9px] px-1 py-0.2 rounded font-mono text-slate-500 bg-slate-100">Member</span>';
+              if (r.authorRole === 'superadmin' || r.authorRole === 'admin') {
+                rRoleBadge = '<span class="text-[9px] px-1 py-0.2 rounded font-mono font-bold bg-amber-100 text-amber-800">Admin</span>';
+              } else if (r.authorRole === 'student') {
+                rRoleBadge = '<span class="text-[9px] px-1 py-0.2 rounded font-mono text-sky-700 bg-sky-100">Student</span>';
+              }
+              const rDate = new Date(r.createdAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+              return '<div class="bg-slate-50/80 rounded-lg p-3 border border-slate-100 text-xs">' +
+                '<div class="flex items-center justify-between mb-1">' +
+                  '<div class="flex items-center space-x-2">' +
+                    '<span class="font-bold text-slate-800">' + escapeHtmlText(r.authorName) + '</span>' +
+                    rRoleBadge +
+                  '</div>' +
+                  '<span class="text-[10px] text-slate-400 font-mono">' + rDate + '</span>' +
+                '</div>' +
+                '<div class="text-slate-700 leading-relaxed font-sans">' + nl2br(r.content) + '</div>' +
+              '</div>';
+            }).join('') +
+          '</div>';
+        }
+
+        const pDate = new Date(p.createdAt).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+        return '<div class="bg-white rounded-xl border border-slate-200 p-5 shadow-sm space-y-3 transition-all hover:border-slate-300" id="com-card-' + p.id + '">' +
+          '<!-- Top Card Header -->' +
+          '<div class="flex items-start justify-between gap-2">' +
+            '<div class="space-y-1">' +
+              '<div class="flex items-center flex-wrap gap-2">' +
+                catBadge +
+                statusBadge +
+                pinnedRibbon +
+              '</div>' +
+              '<h4 class="text-sm font-bold text-slate-900 mt-1">' + escapeHtmlText(p.title) + '</h4>' +
+            '</div>' +
+            '<div class="flex items-center space-x-2 shrink-0">' +
+              statusControls +
+              deleteBtn +
+            '</div>' +
+          '</div>' +
+
+          '<!-- Author Meta -->' +
+          '<div class="flex items-center space-x-2 text-xs text-slate-500">' +
+            '<div class="w-6 h-6 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-[10px]">' +
+              escapeHtmlText((p.authorName || p.authorEmail).charAt(0).toUpperCase()) +
+            '</div>' +
+            '<span class="font-semibold text-slate-700">' + escapeHtmlText(p.authorName) + '</span>' +
+            '<span class="text-slate-400 font-mono text-[11px]">&lt;' + escapeHtmlText(p.authorEmail) + '&gt;</span>' +
+            roleBadge +
+            '<span class="text-slate-300">•</span>' +
+            '<span class="text-[11px] text-slate-400 font-mono">' + pDate + '</span>' +
+          '</div>' +
+
+          '<!-- Body Content -->' +
+          '<div class="text-xs text-slate-700 leading-relaxed font-sans bg-slate-50/50 p-3 rounded-lg border border-slate-100 select-text">' +
+            nl2br(p.content) +
+          '</div>' +
+
+          '<!-- Replies Thread -->' +
+          repliesHtml +
+
+          '<!-- Inline Quick Reply Box -->' +
+          '<form data-id="' + p.id + '" onsubmit="submitCommunityReply(event, this.dataset.id)" class="pt-2 flex items-center space-x-2">' +
+            '<input type="text" id="reply-input-' + p.id + '" required placeholder="Write a reply or answer to this topic..." class="flex-1 text-xs px-3 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-sky-500 bg-slate-50 focus:bg-white" />' +
+            '<button type="submit" class="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors flex items-center space-x-1 shrink-0">' +
+              '<i class="fa-solid fa-reply text-[10px]"></i>' +
+              '<span>Reply</span>' +
+            '</button>' +
+          '</form>' +
+        '</div>';
+      }).join('');
+    }
+
+    function openCommunityModal() {
+      const modal = document.getElementById('community-modal');
+      const err = document.getElementById('com-post-error');
+      if (err) err.classList.add('hidden');
+      if (modal) modal.classList.remove('hidden');
+      const titleInput = document.getElementById('com-post-title');
+      if (titleInput) {
+        titleInput.value = '';
+        titleInput.focus();
+      }
+      const contentInput = document.getElementById('com-post-content');
+      if (contentInput) contentInput.value = '';
+    }
+
+    function closeCommunityModal() {
+      const modal = document.getElementById('community-modal');
+      if (modal) modal.classList.add('hidden');
+    }
+
+    async function submitCommunityPost(e) {
+      e.preventDefault();
+      const cat = document.getElementById('com-category-select').value;
+      const title = document.getElementById('com-post-title').value.trim();
+      const content = document.getElementById('com-post-content').value.trim();
+      const pinEl = document.getElementById('com-post-pinned');
+      const isPinned = pinEl ? pinEl.checked : false;
+      const btn = document.getElementById('btn-submit-community-post');
+      const errEl = document.getElementById('com-post-error');
+
+      if (!title || !content) {
+        if (errEl) {
+          errEl.textContent = 'Please fill out both the title and details.';
+          errEl.classList.remove('hidden');
+        }
+        return;
+      }
+
+      try {
+        if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Publishing...</span>';
+        const res = await fetch('/api/community/posts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ category: cat, title, content, isPinned }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to publish post');
+
+        closeCommunityModal();
+        await loadCommunityPosts();
+      } catch (err) {
+        if (errEl) {
+          errEl.textContent = err.message || 'Error creating post';
+          errEl.classList.remove('hidden');
+        }
+      } finally {
+        if (btn) btn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> <span>Publish Post</span>';
+      }
+    }
+
+    async function submitCommunityReply(e, postId) {
+      e.preventDefault();
+      const input = document.getElementById('reply-input-' + postId);
+      if (!input) return;
+      const content = input.value.trim();
+      if (!content) return;
+
+      try {
+        input.disabled = true;
+        const res = await fetch('/api/community/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ postId, content }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to submit reply');
+        input.value = '';
+        await loadCommunityPosts();
+      } catch (err) {
+        alert('Could not submit reply: ' + err.message);
+      } finally {
+        if (input) input.disabled = false;
+      }
+    }
+
+    async function changeCommunityStatus(postId, newStatus) {
+      try {
+        const res = await fetch('/api/community/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ postId, status: newStatus }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to update status');
+        await loadCommunityPosts();
+      } catch (err) {
+        alert('Could not update status: ' + err.message);
+      }
+    }
+
+    async function deleteCommunityPost(postId) {
+      if (!confirm('Are you sure you want to delete this post? This action cannot be undone.')) return;
+      try {
+        const res = await fetch('/api/community/posts?id=' + encodeURIComponent(postId), {
+          method: 'DELETE',
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to delete post');
+        await loadCommunityPosts();
+      } catch (err) {
+        alert('Could not delete post: ' + err.message);
+      }
+    }
+
     // STUDENT TEMPORARY MAILBOX MANAGEMENT
     let allStudents = [];
 
@@ -3580,6 +4381,8 @@ function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAcc
       const dnsView = document.getElementById('dns-view');
       const meetView = document.getElementById('meet-view');
       const securityView = document.getElementById('security-view');
+      const communityView = document.getElementById('community-view');
+      const btnCommunity = document.getElementById('btn-community');
       const btnMeet = document.getElementById('btn-meet');
       const btnDns = document.getElementById('btn-dns');
       const btnSecurity = document.getElementById('btn-security');
@@ -3588,12 +4391,18 @@ function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAcc
       if (dnsView) dnsView.classList.add('hidden');
       if (meetView) meetView.classList.add('hidden');
       if (securityView) securityView.classList.add('hidden');
+      if (communityView) communityView.classList.add('hidden');
 
+      if (btnCommunity) btnCommunity.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
       if (btnMeet) btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
       if (btnDns) btnDns.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
       if (btnSecurity) btnSecurity.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-slate-300 hover:bg-slate-800 transition-colors';
 
-      if (t === 'meet') {
+      if (t === 'community') {
+        if (communityView) communityView.classList.remove('hidden');
+        if (btnCommunity) btnCommunity.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-sky-600/20 text-sky-400 font-semibold';
+        loadCommunityPosts();
+      } else if (t === 'meet') {
         if (meetView) meetView.classList.remove('hidden');
         if (btnMeet) btnMeet.className = 'w-full flex items-center justify-between px-3 py-2 rounded-md text-sm bg-rose-600/20 text-rose-300 font-semibold';
       } else if (t === 'dns') {
