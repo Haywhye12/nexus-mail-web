@@ -1,4 +1,5 @@
 import PostalMime from 'postal-mime';
+import { Buffer } from 'node:buffer';
 
 export interface Env {
   RESEND_API_KEY?: string;
@@ -264,7 +265,7 @@ function rowToMessage(row: any): any {
   };
 }
 
-async function saveMessageToDB(db: D1Database, msg: any) {
+async function saveMessageToDB(db: any, msg: any) {
   const attachmentsJson = JSON.stringify(msg.attachments || []);
   await db.prepare(`
     INSERT OR REPLACE INTO messages (
@@ -975,21 +976,21 @@ export default {
         });
       }
 
-      const results = { migrated: 0, errors: [] };
+      const results: { migrated: number; errors: Array<{ key: string; error: string }> } = { migrated: 0, errors: [] };
 
       try {
         let keysToMigrate = [];
         if (env.EMAILS) {
           try {
             const list = await env.EMAILS.list({ prefix: 'msg:' });
-            keysToMigrate = list.keys.map((k) => k.name);
+            keysToMigrate = list.keys.map((k: any) => k.name);
           } catch (e) {
             console.warn('KV list failed, reading index:messages:', e);
           }
           if (keysToMigrate.length === 0) {
             try {
               const index = (await env.EMAILS.get('index:messages', 'json')) || [];
-              keysToMigrate = index.map((k) => k.startsWith('msg:') ? k : `msg:${k}`);
+              keysToMigrate = index.map((k: string) => k.startsWith('msg:') ? k : `msg:${k}`);
             } catch (e) {}
           }
         }
@@ -1004,7 +1005,7 @@ export default {
               await saveMessageToDB(env.DB, msg);
               results.migrated++;
             }
-          } catch (mErr) {
+          } catch (mErr: any) {
             console.error(`Failed migrating key ${key}:`, mErr);
             results.errors.push({ key, error: mErr.message });
           }
@@ -1013,7 +1014,7 @@ export default {
         return new Response(JSON.stringify({ success: true, ...results }), {
           headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
         });
-      } catch (err) {
+      } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message || 'Migration failed.' }), {
           status: 500,
           headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
@@ -1589,7 +1590,7 @@ export default {
           if (id) {
             try {
               const list = await env.EMAILS.list({ prefix: 'msg:' });
-              const oldKey = list.keys.find((k) => k.name.endsWith(id));
+              const oldKey = list.keys.find((k: any) => k.name.endsWith(id));
               if (oldKey) {
                 await env.EMAILS.delete(oldKey.name);
               }
@@ -1791,7 +1792,7 @@ export default {
           if (env.EMAILS) {
             try {
               const list = await env.EMAILS.list({ prefix: 'msg:' });
-              const draftKey = list.keys.find((k) => k.name.endsWith(draftId));
+              const draftKey = list.keys.find((k: any) => k.name.endsWith(draftId));
               if (draftKey) {
                 await env.EMAILS.delete(draftKey.name);
               }
@@ -1877,7 +1878,7 @@ export default {
         if (env.EMAILS) {
           try {
             const list = await env.EMAILS.list({ prefix: 'msg:' });
-            const target = list.keys.find((k) => k.name.endsWith(id));
+            const target = list.keys.find((k: any) => k.name.endsWith(id));
 
             if (target) {
               if (action === 'delete') {
