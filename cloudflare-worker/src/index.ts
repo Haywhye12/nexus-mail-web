@@ -5075,6 +5075,75 @@ function renderWebAppHtml(currentUserEmail?: string, currentStudent?: StudentAcc
       document.getElementById('btn-submit-icon').className = 'fa-solid fa-paper-plane text-xs';
     }
 
+    // ATTACHMENT MANAGEMENT
+    function handleFileSelected(event) {
+      const files = event.target.files;
+      if (!files || files.length === 0) return;
+
+      Array.from(files).forEach((file) => {
+        // Enforce 10MB limit per file
+        if (file.size > 10 * 1024 * 1024) {
+          alert('File "' + file.name + '" exceeds the maximum allowed size of 10MB.');
+          return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = function(e) {
+          const result = e.target.result;
+          const base64 = typeof result === 'string' ? result.split(',')[1] : '';
+          attachedFiles.push({
+            filename: file.name,
+            mimeType: file.type || 'application/octet-stream',
+            size: file.size,
+            contentBase64: base64
+          });
+          renderAttachmentTray();
+        };
+        reader.readAsDataURL(file);
+      });
+
+      event.target.value = '';
+    }
+
+    function renderAttachmentTray() {
+      const tray = document.getElementById('compose-attachments-tray');
+      const list = document.getElementById('compose-attachments-list');
+      if (!tray || !list) return;
+
+      if (!attachedFiles || attachedFiles.length === 0) {
+        tray.classList.add('hidden');
+        list.innerHTML = '';
+        return;
+      }
+
+      tray.classList.remove('hidden');
+      list.innerHTML = attachedFiles.map((att, idx) => {
+        const sizeKb = Math.round((att.size || 0) / 1024);
+        return '<div class="flex items-center space-x-1.5 px-2.5 py-1 bg-white border border-slate-200 rounded-md text-xs text-slate-700 shadow-2xs">' +
+          '<i class="fa-solid fa-paperclip text-slate-400 text-[10px]"></i>' +
+          '<span class="font-medium truncate max-w-[140px]" title="' + escapeHtmlText(att.filename) + '">' + escapeHtmlText(att.filename) + '</span>' +
+          '<span class="text-slate-400 font-mono text-[10px]">(' + sizeKb + ' KB)</span>' +
+          '<button type="button" data-idx="' + idx + '" onclick="removeAttachment(parseInt(this.dataset.idx, 10))" class="text-slate-400 hover:text-rose-500 ml-1 p-0.5" title="Remove attachment">' +
+            '<i class="fa-solid fa-xmark text-[10px]"></i>' +
+          '</button>' +
+        '</div>';
+      }).join('');
+    }
+
+    function removeAttachment(index) {
+      if (index >= 0 && index < attachedFiles.length) {
+        attachedFiles.splice(index, 1);
+        renderAttachmentTray();
+      }
+    }
+
+    function clearAttachments() {
+      attachedFiles = [];
+      const fileInput = document.getElementById('file-input');
+      if (fileInput) fileInput.value = '';
+      renderAttachmentTray();
+    }
+
     // COMPOSE & DRAFTS
     function openCompose(draft) {
       const modal = document.getElementById('compose-modal');
