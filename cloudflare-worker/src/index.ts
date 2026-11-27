@@ -850,15 +850,34 @@ export default {
         const { action, text, context, tone } = body;
         const geminiKey = (env.GEMINI_API_KEY || '').trim();
 
+        // Helper to strip HTML tags, script, style blocks, and excess whitespace
+        const cleanPlainText = (input: string): string => {
+          if (!input) return '';
+          return input
+            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&amp;/gi, '&')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"')
+            .replace(/\s+/g, ' ')
+            .trim();
+        };
+
+        const sanitizedText = cleanPlainText(text);
+
         if (geminiKey) {
           // Use official Gemini 1.5 Flash endpoint
           let prompt = '';
           if (action === 'summarize') {
-            prompt = `You are an executive email assistant. Provide a concise, bulleted executive summary (max 3 bullets) of the following email thread, highlighting action items and core message:\n\n${text}`;
+            prompt = `You are an executive email assistant. Provide a concise, bulleted executive summary (max 3 bullets) of the following email, highlighting action items and the core message. Ignore disclaimer boilerplate like "do not respond":\n\n${sanitizedText}`;
           } else if (action === 'reply') {
-            prompt = `You are a professional email assistant. Draft a courteous, clear, and relevant email reply to this email:\nContext: ${context || ''}\nEmail received:\n${text}\nKeep it professional and concise.`;
+            prompt = `You are a professional email assistant. Draft a courteous, clear, and relevant email reply to this email:\nContext: ${context || ''}\nEmail received:\n${sanitizedText}\nKeep it professional and concise.`;
           } else if (action === 'polish') {
-            prompt = `You are an expert editor. Rewrite and polish this email draft to make it sound ${tone || 'Professional, crisp, and persuasive'}:\n\nDraft:\n${text}\n\nReturn only the polished email text.`;
+            prompt = `You are an expert editor. Rewrite and polish this email draft to make it sound ${tone || 'Professional, crisp, and persuasive'}:\n\nDraft:\n${sanitizedText}\n\nReturn only the polished email text.`;
           }
 
           const aiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`, {
@@ -882,11 +901,23 @@ export default {
         // High-fidelity Built-in Fallback NLP Engine (Zero API Key needed)
         let fallbackResult = '';
         if (action === 'summarize') {
-          const sentences = (text || '').replace(/\r?\n/g, ' ').split(/[.!?]+/).map((s: string) => s.trim()).filter((s: string) => s.length > 15);
+          // Filter out disclaimers and boilerplate lines
+          const sentences = sanitizedText
+            .split(/(?<=[.!?])\s+/)
+            .map((s: string) => s.trim())
+            .filter((s: string) => {
+              if (s.length < 15) return false;
+              const lower = s.toLowerCase();
+              if (lower.includes('do not respond') || lower.includes('system generated') || lower.includes('html') || lower.includes('style>')) {
+                return false;
+              }
+              return true;
+            });
+
           const topSentences = sentences.slice(0, 3);
           fallbackResult = topSentences.length > 0 ?
-            topSentences.map((s: string) => `• ${s}.`).join('\n') :
-            '• Message received. Review details for full context.';
+            topSentences.map((s: string) => `• ${s.replace(/\.?$/, '.')}`).join('\n') :
+            '• Automated notification received from sender.\n• Please review the attached document or message body for transaction records.';
         } else if (action === 'reply') {
           fallbackResult = `Hi there,\n\nThank you for reaching out to DevGeeksNexus. I have received your message regarding this matter and will review the details promptly.\n\nBest regards,\nDevGeeksNexus Team`;
         } else if (action === 'polish') {
@@ -2572,7 +2603,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       document.getElementById('ai-dropdown-menu').classList.add('hidden');
       if (!selectedMsg) return;
 
-      const bodyText = selectedMsg.text || selectedMsg.html || '';
+      const bodyText = selectedMsg.text || (selectedMsg.html ? selectedMsg.html.replace(/<[^>]*>/g, ' ') : '') || '';
 
       if (action === 'summarize') {
         const summaryBox = document.getElementById('ai-summary-box');
