@@ -894,7 +894,7 @@ export default {
       }
 
       // Serve Login / OTP Page
-      return new Response(renderLoginHtml('ayomidebobani@gmail.com'), {
+      return new Response(renderLoginHtml(''), {
         headers: {
           'Content-Type': 'text/html; charset=utf-8',
           'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
