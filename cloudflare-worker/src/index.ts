@@ -509,7 +509,11 @@ export default {
         url.searchParams.get('meet') ||
         url.pathname.replace(/^\/meet\/?/, '').trim();
       return new Response(renderStandaloneMeetHtml(roomParam || 'devgeeksnexus-training'), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+          'Pragma': 'no-cache',
+        },
       });
     }
 
@@ -707,7 +711,11 @@ export default {
 
       // Serve Login / OTP Page
       return new Response(renderLoginHtml('ayomidebobani@gmail.com'), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+          'Pragma': 'no-cache',
+        },
       });
     }
 
@@ -1289,7 +1297,11 @@ export default {
 
     // Default: Serve the complete Nexus Suite for Authenticated User
     return new Response(renderWebAppHtml(authEmail), {
-      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        'Pragma': 'no-cache',
+      },
     });
   },
 };
@@ -2665,6 +2677,11 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       openCompose(selectedMsg);
     }
 
+    function nl2br(str) {
+      if (!str) return '';
+      return String(str).split(String.fromCharCode(10)).join('<br/>');
+    }
+
     function replyToCurrentMessage() {
       if (!selectedMsg) return;
       openCompose();
@@ -2684,7 +2701,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       const editor = document.getElementById('compose-editor');
       const senderDisplay = selectedMsg.fromName ? (selectedMsg.fromName + ' &lt;' + selectedMsg.from + '&gt;') : selectedMsg.from;
       const formattedDate = new Date(selectedMsg.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
-      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\\n/g, '<br/>') + '</p>' : '');
+      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + nl2br(selectedMsg.text) + '</p>' : '');
 
       editor.innerHTML = '<p></p><br><div class="gmail_quote" style="border-left: 2px solid #cbd5e1; padding-left: 10px; margin-left: 2px; color: #64748b; font-size: 13px;"><p style="margin: 0 0 6px 0;">On ' + formattedDate + ', ' + senderDisplay + ' wrote:</p><div>' + origBody + '</div></div>';
       setTimeout(function() {
@@ -2723,7 +2740,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
       const senderDisplay = selectedMsg.fromName ? (selectedMsg.fromName + ' &lt;' + selectedMsg.from + '&gt;') : selectedMsg.from;
       const formattedDate = new Date(selectedMsg.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
       const origTo = selectedMsg.to ? '<br><strong>To:</strong> ' + selectedMsg.to : '';
-      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + selectedMsg.text.replace(/\\n/g, '<br/>') + '</p>' : '');
+      const origBody = selectedMsg.html || (selectedMsg.text ? '<p>' + nl2br(selectedMsg.text) + '</p>' : '');
 
       editor.innerHTML = '<p></p><br><div class="forwarded_message" style="border-left: 2px solid #cbd5e1; padding-left: 12px; margin-left: 2px; color: #475569; font-size: 13px;">' +
         '<p style="margin: 0 0 8px 0; color: #64748b; font-size: 12px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">' +
@@ -3347,7 +3364,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         });
         const data = await res.json();
         if (data.success && data.result) {
-          editor.innerHTML = '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + data.result.replace(/\\n/g, '<br/>') + '</div>';
+          editor.innerHTML = '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + nl2br(data.result) + '</div>';
           notice.textContent = 'Polished with AI (' + tone + ')!';
           setTimeout(() => { notice.classList.add('hidden'); }, 3000);
         } else {
@@ -3407,7 +3424,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
           });
           const data = await res.json();
           if (data.success) {
-            editor.innerHTML = '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + data.result.replace(/\\n/g, '<br/>') + '</div>';
+            editor.innerHTML = '<div style="font-family: sans-serif; line-height: 1.6; color: #1e293b;">' + nl2br(data.result) + '</div>';
             insertSignature();
           } else {
             editor.innerHTML = '<p>Hi there,</p><p>Thank you for reaching out.</p>';
@@ -3466,7 +3483,7 @@ function renderWebAppHtml(currentUserEmail?: string): string {
         document.getElementById('compose-from').value = draft.from || draft.account || 'info@devgeeksnexus.com';
         document.getElementById('compose-to').value = draft.to || '';
         document.getElementById('compose-subject').value = draft.subject === '(Draft)' ? '' : (draft.subject || '');
-        editor.innerHTML = draft.html || (draft.text ? '<p>' + draft.text.replace(/\\n/g, '<br/>') + '</p>' : '');
+        editor.innerHTML = draft.html || (draft.text ? '<p>' + nl2br(draft.text) + '</p>' : '');
 
         if (draft.cc) {
           document.getElementById('field-cc').classList.remove('hidden');
